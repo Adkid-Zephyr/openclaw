@@ -142,6 +142,9 @@ export function createBlockReplyDeliveryHandler(params: {
     if (skip && !hasOutboundReplyContent({ ...payload, text: undefined })) {
       return;
     }
+    const isSourceTextBlock =
+      params.blockStreamingEnabled && isReplyPayloadTerminalContent(payload) && !payload.isError;
+    const preserveLeadingParagraphBoundary = isSourceTextBlock && hasAcceptedTextBlock;
 
     const implicitCurrentMessageAllowed =
       payload.replyToCurrent === true
@@ -173,7 +176,7 @@ export function createBlockReplyDeliveryHandler(params: {
       currentMessageId: params.currentMessageId,
       silentToken: SILENT_REPLY_TOKEN,
       trimLeadingWhitespace: true,
-      preserveLeadingParagraphBoundary: hasAcceptedTextBlock,
+      preserveLeadingParagraphBoundary,
       parseMode: "auto",
       extractMediaDirectives: false,
     });
@@ -200,9 +203,15 @@ export function createBlockReplyDeliveryHandler(params: {
     if (normalized.isSilent && !blockHasNonTextContent) {
       return;
     }
+    setReplyPayloadMetadata(blockPayload, {
+      streamedParagraphBoundary:
+        preserveLeadingParagraphBoundary && /^\n[\t ]*\n+/.test(blockPayload.text ?? "")
+          ? true
+          : undefined,
+    });
 
     if (blockPayload.text) {
-      hasAcceptedTextBlock = true;
+      hasAcceptedTextBlock ||= isSourceTextBlock;
       void params.typingSignals.signalTextDelta(blockPayload.text).catch((err: unknown) => {
         logVerbose(`block reply typing signal failed: ${String(err)}`);
       });
