@@ -1,7 +1,11 @@
 import type { GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
+import { projectSessionResultRows } from "./reconcile.ts";
 import type { SessionArchiveVisibility } from "./session-capability.ts";
 
-type ConfirmedArchiveState = Pick<GatewaySessionRow, "archivedAt" | "archivedBy" | "sessionId">;
+type ConfirmedArchiveState = Pick<
+  GatewaySessionRow,
+  "archivedAt" | "archivedBy" | "archiveReason" | "sessionId"
+>;
 
 export function createSessionArchiveState(
   publishedRow: (key: string) => GatewaySessionRow | undefined,
@@ -32,6 +36,7 @@ export function createSessionArchiveState(
       confirmed.set(normalizedKey, {
         archivedAt: row?.archivedAt ?? previous?.archivedAt,
         archivedBy: row?.archivedBy ?? previous?.archivedBy,
+        archiveReason: row?.archiveReason ?? previous?.archiveReason,
         sessionId: row?.sessionId || previous?.sessionId,
       });
     },
@@ -39,7 +44,6 @@ export function createSessionArchiveState(
       if (!result || confirmed.size === 0) {
         return result;
       }
-      let changed = false;
       const sessions = result.sessions.map((row) => {
         const archive = confirmed.get(row.key);
         if (!archive) {
@@ -56,15 +60,15 @@ export function createSessionArchiveState(
         if (row.archived === true) {
           return row;
         }
-        changed = true;
         return {
           ...row,
           archived: true,
           ...(archive.archivedAt !== undefined ? { archivedAt: archive.archivedAt } : {}),
           ...(archive.archivedBy ? { archivedBy: archive.archivedBy } : {}),
+          ...(archive.archiveReason ? { archiveReason: archive.archiveReason } : {}),
         };
       });
-      return changed ? { ...result, sessions } : result;
+      return projectSessionResultRows(result, sessions);
     },
     visibility: (key: string): SessionArchiveVisibility | undefined => {
       const normalizedKey = key.trim();

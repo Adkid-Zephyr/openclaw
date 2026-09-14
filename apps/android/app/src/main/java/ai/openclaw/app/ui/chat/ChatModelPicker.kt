@@ -28,9 +28,28 @@ internal fun thinkingSupportedForSelection(
   selectedModelRef: String?,
   catalog: List<GatewayModelSummary>,
 ): Boolean {
-  val selected = selectedModelRef ?: return true
-  return catalog.firstOrNull { it.providerQualifiedRef() == selected }?.supportsReasoning != false
+  val selected = selectedModelRef ?: return false
+  return catalog.firstOrNull { it.providerQualifiedRef() == selected }?.thinkingLevels?.any { it.id != "off" } == true
 }
+
+internal fun fastModeRequestSupportedForSelection(
+  selectedModelRef: String?,
+  sessionModelProvider: String?,
+  catalog: List<GatewayModelSummary>,
+): Boolean {
+  val selected = selectedModelRef?.trim() ?: return false
+  val qualified = catalog.filter { it.providerQualifiedRef().equals(selected, ignoreCase = true) }
+  val matches =
+    qualified.ifEmpty {
+      catalog.filter { it.id == selected && it.provider == sessionModelProvider }
+    }
+  return matches.isNotEmpty() && matches.all { it.supportsFastMode == true }
+}
+
+internal fun fastModeSupportedForSelection(
+  requestSupported: Boolean,
+  hasConfiguredFastModeOverride: Boolean,
+): Boolean = requestSupported || hasConfiguredFastModeOverride
 
 internal fun selectedChatModelUnavailableReason(
   selectedModelRef: String?,
@@ -72,8 +91,10 @@ internal fun chatModelSendBlocked(
 internal fun chatModelPickerAction(model: GatewayModelSummary): ChatModelPickerAction =
   when {
     model.available != false -> ChatModelPickerAction.Select
+
     model.unavailableReason == GatewayModelUnavailableReason.MissingAuth ||
       model.unavailableReason == GatewayModelUnavailableReason.AuthFailed -> ChatModelPickerAction.OpenProviders
+
     else -> ChatModelPickerAction.Disabled
   }
 
@@ -82,6 +103,7 @@ internal fun chatModelUnavailableText(reason: GatewayModelUnavailableReason?): N
     GatewayModelUnavailableReason.MissingAuth,
     GatewayModelUnavailableReason.AuthFailed,
     -> nativeText("Authentication needed")
+
     else -> null
   }
 

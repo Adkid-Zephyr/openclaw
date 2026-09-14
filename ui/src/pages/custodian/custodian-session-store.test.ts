@@ -2,20 +2,13 @@
 
 import { buildSystemAgentSessionInvalidatedErrorDetails } from "@openclaw/gateway-protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
 import { installSafeLocalStorageForTesting } from "../../test-helpers/storage.ts";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
 import { createContext } from "./custodian-page.test-harness.ts";
 import { CustodianSessionStore } from "./custodian-session-store.ts";
 import { custodianErrorMessage } from "./transcript.ts";
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
 
 describe("CustodianSessionStore", () => {
   beforeEach(() => {
@@ -451,6 +444,41 @@ describe("CustodianSessionStore", () => {
     },
   );
 
+  it.each([
+    { edits: [], expected: "Original question" },
+    { edits: ["New question"], expected: "New question" },
+    { edits: ["New question", ""], expected: "" },
+  ])(
+    "preserves the latest ordinary draft after an unsent failure: $edits",
+    async ({ edits, expected }) => {
+      const pending = deferred();
+      const request = vi
+        .fn()
+        .mockResolvedValueOnce({ sessionId: "draft-session", reply: "Ready." })
+        .mockImplementationOnce(() =>
+          pending.promise.then(() => {
+            throw new Error("Request was not sent.");
+          }),
+        );
+      const { context } = createContext(request);
+      const store = new CustodianSessionStore();
+      store.connect(context, "caretaker");
+      await waitForFast(() => expect(store.canSend).toBe(true));
+      store.setInput("Original question");
+      const sending = store.send();
+      expect(store.input).toBe("");
+      for (const edit of edits) {
+        store.setInput(edit);
+      }
+      pending.resolve();
+      await expect(sending).resolves.toBe("rejected");
+      expect(store.input).toBe(expected);
+      expect(store.hasRealUserTurn()).toBe(false);
+      expect(store.error).toBe("Request was not sent.");
+      expect(request).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it("rechecks failed inference without replaying a user turn", async () => {
     const request = vi
       .fn()
@@ -459,13 +487,16 @@ describe("CustodianSessionStore", () => {
         reply: "Ready.",
         action: "none",
       })
-      .mockRejectedValueOnce(
-        new GatewayRequestError({
-          code: "UNAVAILABLE",
-          message: "Runtime verification failed.",
-          details: { code: "system_agent_inference_unavailable" },
-        }),
-      )
+      .mockImplementationOnce((_method, _params, options?: { onSent?: () => void }) => {
+        options?.onSent?.();
+        return Promise.reject(
+          new GatewayRequestError({
+            code: "UNAVAILABLE",
+            message: "Runtime verification failed.",
+            details: { code: "system_agent_inference_unavailable" },
+          }),
+        );
+      })
       .mockResolvedValueOnce({
         sessionId: "shared-session",
         reply: "Recovered.",
@@ -593,7 +624,7 @@ describe("CustodianSessionStore", () => {
     store.connect(context, "caretaker");
     await waitForFast(() => expect(request).toHaveBeenCalledOnce());
 
-    store.openModelSetup();
+    store.exitSetup("model-setup");
     expect(requestSignal?.aborted).toBe(true);
     expect(store.sending).toBe(false);
     resolveReply({

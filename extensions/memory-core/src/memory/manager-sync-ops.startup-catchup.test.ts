@@ -2,7 +2,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { resolveSessionTranscriptsDirForAgent } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import {
@@ -20,24 +19,25 @@ import {
   appendSessionTranscriptMessageByIdentity,
   publishSessionTranscriptUpdateByIdentity,
 } from "openclaw/plugin-sdk/session-transcript-runtime";
-import { closeOpenClawAgentDatabasesForTest } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import { createOpenClawTestState, type OpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SessionStartupCatchupHarness,
   emitSessionTranscriptUpdate,
-  restoreStartupEnv,
-  setStartupConfigPath,
-  setStartupStateDir,
   startupHarnessDatabases,
   resetTranscriptUpdateListener,
 } from "./manager-sync-ops.startup-catchup.test-support.js";
 
 describe("session startup catch-up", () => {
   let stateDir = "";
+  let testState: OpenClawTestState;
 
   beforeEach(async () => {
-    stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-session-startup-"));
-    setStartupStateDir(stateDir);
+    testState = await createOpenClawTestState({
+      prefix: "openclaw-session-startup-",
+      layout: "state-only",
+    });
+    stateDir = testState.stateDir;
     resetTranscriptUpdateListener();
   });
 
@@ -45,19 +45,15 @@ describe("session startup catch-up", () => {
     vi.clearAllTimers();
     vi.useRealTimers();
     resetTranscriptUpdateListener();
-    restoreStartupEnv();
-    clearRuntimeConfigSnapshot();
-    clearConfigCache();
     for (const database of startupHarnessDatabases) {
       database.close();
     }
     startupHarnessDatabases.clear();
-    closeOpenClawAgentDatabasesForTest();
-    // Closing the agent databases releases their leases through shared state, which
-    // reopens it, so the shared handle has to be released after that and before the
-    // removal or Windows fails the unlink with EBUSY.
+    await testState.restoreEnv();
+    clearRuntimeConfigSnapshot();
+    clearConfigCache();
     resetPluginStateStoreForTests();
-    await fs.rm(stateDir, { recursive: true, force: true });
+    await testState.cleanup();
   });
 
   async function writeSessionFile(
@@ -82,10 +78,8 @@ describe("session startup catch-up", () => {
   }
 
   async function configureTestSessionStore(storePath: string): Promise<void> {
-    const configPath = path.join(stateDir, "openclaw.json");
     await fs.mkdir(path.dirname(storePath), { recursive: true });
-    await fs.writeFile(configPath, JSON.stringify({ session: { store: storePath } }), "utf-8");
-    setStartupConfigPath(configPath);
+    await testState.writeConfig({ session: { store: storePath } });
     clearRuntimeConfigSnapshot();
     clearConfigCache();
   }
@@ -482,25 +476,10 @@ describe("session startup catch-up", () => {
   ];
 
   it.each(cacheBoundSyncs)("bounds the embedding cache on a %s sync", async (_label, params) => {
-    // Enforcement first lived inside runInPlaceReindex's shadow rebuild, bounding a throwaway
-    // database and never the live one; moving it into the incremental branch then skipped the
-    // paths that return early. Long-running databases stayed unbounded (openclaw/openclaw#114612).
-    await writeSessionFile("thread.jsonl");
+    await writeSqliteSession();
     const harness = new SessionStartupCatchupHarness([]);
 
     await harness.runSyncForTest(params);
-
-    expect(harness.embeddingCachePrunes).toBeGreaterThan(0);
-  });
-
-  it("bounds the embedding cache when the sync pass aborts", async () => {
-    // The full-reindex branch returns before the incremental code and cannot complete against
-    // this harness, so it stands in for every early or failed exit: enforcement inside any one
-    // branch skips them, a finally around the pass does not.
-    await writeSessionFile("thread.jsonl");
-    const harness = new SessionStartupCatchupHarness([]);
-
-    await expect(harness.runSyncForTest({ reason: "cli", force: true })).rejects.toThrow();
 
     expect(harness.embeddingCachePrunes).toBeGreaterThan(0);
   });

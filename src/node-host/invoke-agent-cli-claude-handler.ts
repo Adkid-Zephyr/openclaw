@@ -169,7 +169,8 @@ export async function handleClaudeCliNodeInvoke(params: {
   await (params.runtime.handleSystemRun ?? handleSystemRunInvoke)({
     client: params.client,
     // The command-specific validator is the execution boundary. Approval sees
-    // every executable argument; prompt/stdin content remains request input.
+    // every caller-supplied executable argument. The node adds its own prompt,
+    // verified resources, and invocation-only MCP proxy after approval.
     params: {
       command: approvalCommand,
       ...(request.cwd ? { cwd: request.cwd } : {}),
@@ -187,7 +188,7 @@ export async function handleClaudeCliNodeInvoke(params: {
     resolveExecAsk: params.deps.resolveExecAsk,
     isCmdExeInvocation: params.deps.isCmdExeInvocation,
     sanitizeEnv: params.deps.sanitizeEnv,
-    runCommand: async (approvalArgv, cwd, env, timeoutMs) => {
+    runCommand: async (approvalArgv, cwd, env, timeoutMs, _signal, assertCurrent) => {
       const childEnv = { ...env };
       for (const key of request.clearEnv ?? []) {
         if (!Object.hasOwn(request.env ?? {}, key)) {
@@ -209,6 +210,8 @@ export async function handleClaudeCliNodeInvoke(params: {
           secretInput: preparedSecret.secretInput,
           timeoutMs,
           signal: params.runtime.signal,
+          assertCurrent,
+          skillIo: params.runtime.pluginCommandIo,
         });
       } finally {
         preparedSecret.cleanup();

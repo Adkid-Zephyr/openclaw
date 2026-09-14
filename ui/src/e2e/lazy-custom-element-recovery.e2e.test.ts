@@ -1,3 +1,4 @@
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   buildControlUiFocusPath,
@@ -5,9 +6,12 @@ import {
 } from "@openclaw/session-url-contract";
 import type { Page, Route, Video } from "playwright";
 import { beforeEach, expect, it } from "vitest";
+import { ConnectErrorDetailCodes } from "../../../packages/gateway-protocol/src/connect-error-details.js";
 import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
+import { takeControlUiViewportScreenshot } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import {
+  controlUiSessionUrl,
   defaultControlUiFeatureMethods,
   installMockGateway,
 } from "../test-helpers/control-ui-e2e.ts";
@@ -44,6 +48,7 @@ const suite = createControlUiE2eSuite({
 async function installChunkFailure(page: Page, chunk: RegExp, manualProbe?: Promise<void>) {
   let headCount = 0;
   let chunkRequestCount = 0;
+  let failedChunkUrl: string | undefined;
   await page.route("**/*", async (route) => {
     if (route.request().method() !== "HEAD") {
       await route.fallback();
@@ -58,6 +63,13 @@ async function installChunkFailure(page: Page, chunk: RegExp, manualProbe?: Prom
     await route.fallback();
   });
   await page.route(chunk, async (route: Route) => {
+    // A shared module can have both a facade and implementation matching the
+    // prefix. Count retries of the injected failure, not its other dependencies.
+    failedChunkUrl ??= route.request().url();
+    if (route.request().url() !== failedChunkUrl) {
+      await route.fallback();
+      return;
+    }
     chunkRequestCount += 1;
     if (chunkRequestCount === 1) {
       await route.abort("internetdisconnected");
@@ -163,6 +175,52 @@ const focusedCases = [
 ];
 
 suite.define(() => {
+  it("recovers the login gate after its chunk fails without loading it during admission", async () => {
+    await suite.withPage(
+      { locale: "en-US", serviceWorkers: "block", viewport },
+      async ({ page }) => {
+        const failure = await installChunkFailure(
+          page,
+          /\/assets\/login-gate-[^/?]+\.js(?:\?.*)?$/u,
+        );
+        const gateway = await installMockGateway(page, { deferredMethods: ["connect"] });
+        const rejectLogin = async () => {
+          await gateway.waitForRequest("connect");
+          await gateway.rejectDeferred("connect", {
+            code: "INVALID_REQUEST",
+            message: "token missing",
+            details: { code: ConnectErrorDetailCodes.AUTH_TOKEN_MISSING },
+          });
+        };
+        await page.goto(suite.server.baseUrl);
+        await gateway.waitForRequest("connect");
+        await page.locator(".connect-splash").waitFor();
+        expect(failure.chunkRequestCount()).toBe(0);
+        await rejectLogin();
+        const error = page.locator(".lazy-view-error");
+        await error.waitFor();
+        expect(await error.textContent()).toContain("Failed to fetch dynamically imported module");
+        expect(failure.chunkRequestCount()).toBe(1);
+        await expect.poll(failure.headCount).toBe(1);
+        await Promise.all([
+          page.waitForEvent("domcontentloaded"),
+          error.getByRole("button", { name: "Reload", exact: true }).click(),
+        ]);
+        await rejectLogin();
+        await page.locator('.login-gate__failure[data-kind="auth-required"]').waitFor();
+        expect(failure.chunkRequestCount()).toBe(2);
+        expect(await error.count()).toBe(0);
+        const connectCount = (await gateway.getRequests("connect")).length;
+        await gateway.deferNext("connect");
+        await page.getByRole("button", { name: "Connect", exact: true }).click();
+        await gateway.waitForRequest("connect", { after: connectCount });
+        await gateway.resolveDeferred("connect");
+        await waitForControlUiGatewayReady(page);
+        expect(await page.locator("openclaw-login-gate").count()).toBe(0);
+      },
+    );
+  });
+
   it("does not reload after a lazy surface is dismissed during its retry probe", async () => {
     let releaseProbe = () => {};
     const manualProbe = new Promise<void>((resolve) => {
@@ -226,6 +284,9 @@ suite.define(() => {
                 )) >= 2,
             )
             .toBe(true);
+          // A generic automatic retry used to wake one second after this
+          // first settled frame. Close must remain authoritative beyond it.
+          await page.waitForTimeout(1_500);
           if (documentRequests > 1) {
             await reloaded;
           }
@@ -311,10 +372,12 @@ suite.define(() => {
       await expect.poll(failure.headCount).toBe(1);
       expect(failure.chunkRequestCount()).toBe(1);
       if (captureUiProof) {
-        await page.screenshot({
-          fullPage: true,
-          path: path.join(artifactDir, "failure.png"),
-        });
+        await writeFile(
+          path.join(artifactDir, "failure.png"),
+          await takeControlUiViewportScreenshot(page, error, [
+            error.getByRole("button", { name: "Retry", exact: true }),
+          ]),
+        );
       }
 
       await retryThroughReload(page, error);
@@ -323,11 +386,12 @@ suite.define(() => {
       await expect.poll(failure.chunkRequestCount).toBe(2);
       expect(await page.locator("openclaw-command-palette").count()).toBe(1);
       if (captureUiProof) {
-        await page.screenshot({
-          animations: "disabled",
-          fullPage: true,
-          path: path.join(artifactDir, "recovered.png"),
-        });
+        await writeFile(
+          path.join(artifactDir, "recovered.png"),
+          await takeControlUiViewportScreenshot(page, page.locator(".cmd-palette"), [
+            page.getByRole("combobox", { name: "Search chats and commands…" }),
+          ]),
+        );
       }
     } finally {
       await suite.closeBrowserContext(context);
@@ -335,6 +399,100 @@ suite.define(() => {
         await video.saveAs(path.join(artifactDir, "recovery.webm"));
       }
     }
+  });
+
+  it.each([
+    {
+      name: "Home",
+      label: "Assistant sidebar",
+      tag: "openclaw-assistant-panel",
+      chunk: /\/assets\/assistant-panel-[^/?]+\.js(?:\?.*)?$/u,
+      proofName: "home",
+      open: async (page: Page) => {
+        await page.locator(".sidebar-footer-bar__home").click();
+      },
+      ready: (page: Page) =>
+        page.locator("openclaw-assistant-panel .agent-chat__composer-combobox textarea"),
+    },
+    {
+      name: "System busyness",
+      label: "System busyness",
+      tag: "openclaw-debug-overlay",
+      chunk: /\/assets\/debug-overlay-[^/?]+\.js(?:\?.*)?$/u,
+      proofName: "system-busyness",
+      open: async (page: Page) => {
+        await page.locator(".sidebar-identity-card").click();
+        await page
+          .locator(
+            'wa-dropdown.sidebar-identity-menu wa-dropdown-item[value="command:debug-overlay"]',
+          )
+          .click();
+      },
+      ready: (page: Page) => page.getByRole("complementary", { name: "System busyness" }),
+    },
+  ])("names the pending $name surface and keeps dismissal authoritative", async (testCase) => {
+    await suite.withPage(
+      { locale: "en-US", serviceWorkers: "block", viewport },
+      async ({ page }) => {
+        const workKey = "agent:main:loading-proof";
+        await installMockGateway(page, {
+          sessionKey: workKey,
+          sessions: [workKey, "agent:main:main"].map((key) => ({
+            key,
+            kind: "direct",
+            label: key === workKey ? "Workspace" : "Home",
+            updatedAt: 1,
+          })),
+          featureMethods: [...defaultControlUiFeatureMethods, "chat.history", "chat.send"],
+          historyMessages: [{ role: "assistant", content: "The workspace is ready." }],
+        });
+        const held = await holdModuleResponse(page, testCase.chunk);
+        try {
+          await page.goto(controlUiSessionUrl(suite.server.baseUrl, workKey));
+          await waitForControlUiGatewayReady(page);
+          await testCase.open(page);
+          await held.request;
+          const modal = page.locator("openclaw-modal-dialog");
+          await modal.locator('[role="status"]').waitFor();
+          if (captureUiProof) {
+            await page.screenshot({
+              animations: "disabled",
+              path: path.join(artifactDir, `${testCase.proofName}-loading.png`),
+            });
+          }
+
+          expect(
+            await modal.getByRole("heading", { name: testCase.label, exact: true }).isVisible(),
+          ).toBe(true);
+          const loading = modal.getByRole("status", { name: "Loading…", exact: true });
+          expect(await loading.isVisible()).toBe(true);
+          expect((await loading.textContent())?.trim()).toBe("Loading…");
+          expect(await modal.locator(".loading-skeleton").count()).toBe(0);
+          const close = modal.getByRole("button", { name: "Close", exact: true });
+          expect(await close.isVisible()).toBe(true);
+          await close.click();
+          await modal.waitFor({ state: "detached" });
+
+          held.release();
+          await page.evaluate(
+            (tag) => customElements.whenDefined(tag).then(() => undefined),
+            testCase.tag,
+          );
+          await page.locator(testCase.tag).waitFor({ state: "attached" });
+          expect(await testCase.ready(page).isVisible()).toBe(false);
+          await testCase.open(page);
+          await testCase.ready(page).waitFor();
+          expect(await modal.count()).toBe(0);
+          if (captureUiProof) {
+            await page.screenshot({
+              path: path.join(artifactDir, `${testCase.proofName}-ready.png`),
+            });
+          }
+        } finally {
+          held.release();
+        }
+      },
+    );
   });
 
   it("keeps native titlebar state and actions current while its chunk is loading", async () => {
@@ -407,6 +565,7 @@ suite.define(() => {
       webChrome: true,
       pathname: "",
       readySelector: ".sidebar-brand",
+      preserveCollapsedNavigation: false,
       proofName: "native-titlebar",
     },
     {
@@ -414,8 +573,9 @@ suite.define(() => {
       chunk: /\/assets\/sidebar-attention-[A-Za-z0-9_-]{8}\.js(?:\?.*)?$/u,
       label: "sidebar-attention",
       webChrome: false,
-      pathname: "settings/appearance",
-      readySelector: ".shell--settings",
+      pathname: "chat/main?nav=collapsed",
+      readySelector: ".shell--nav-collapsed",
+      preserveCollapsedNavigation: true,
       proofName: "sidebar-attention",
     },
   ])("recovers $name visibly after its chunk fails", async (testCase) => {
@@ -429,6 +589,15 @@ suite.define(() => {
       async ({ page }) => {
         if (testCase.webChrome) {
           await installNativeWebChrome(page);
+        }
+        if (testCase.preserveCollapsedNavigation) {
+          // Bootstrap consumes this one-shot intent; seed each recovered document
+          // before its router can canonicalize the URL during the retry probe.
+          await page.addInitScript(() => {
+            const url = new URL(window.location.href);
+            url.searchParams.set("nav", "collapsed");
+            window.history.replaceState(window.history.state, "", url);
+          });
         }
         const failure = await installChunkFailure(page, testCase.chunk);
         await installMockGateway(page, {

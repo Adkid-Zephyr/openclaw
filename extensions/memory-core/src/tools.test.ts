@@ -371,6 +371,19 @@ describe("memory_search unavailable payloads", () => {
           "Retry memory_search after a short wait: a memory-corpus timeout pauses retries for up to a minute. If memory-corpus timeouts persist, run: openclaw memory status --deep --agent main, and rebuild with openclaw memory index --force --agent main only if it reports the index dirty or incomplete",
       });
       expect(searchCalls).toBe(1);
+      setMemorySearchImpl(async () => {
+        searchCalls += 1;
+        return [];
+      });
+      await vi.advanceTimersByTimeAsync(59_999);
+      const pausedResult = await tool.execute("search-still-paused", { query: "hello again" });
+      expect(pausedResult.details).toEqual(cooldownResult.details);
+      expect(searchCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const retryResult = await tool.execute("search-retry", { query: "hello again" });
+      expect(retryResult.details).toMatchObject({ results: [] });
+      expect(retryResult.details).not.toHaveProperty("unavailable");
+      expect(searchCalls).toBe(2);
     } finally {
       vi.useRealTimers();
     }
@@ -622,7 +635,8 @@ describe("memory_search unavailable payloads", () => {
       stale: true,
       warning:
         "Memory index is stale: embedding request timed out. Search results may be incomplete.",
-      action: "Run: openclaw memory status --index --agent main",
+      action:
+        "Run: openclaw memory status --index --agent main. Rebuilding may call the configured embedding provider and can incur provider cost.",
     });
   });
 
@@ -678,6 +692,8 @@ describe("memory_search unavailable payloads", () => {
       indexIdentity: {
         status: "mismatched",
         reason,
+        code: "provider",
+        owner: "configuration",
       },
     });
 
@@ -691,10 +707,9 @@ describe("memory_search unavailable payloads", () => {
 
     expectUnavailableMemorySearchDetails(result.details, {
       error: reason,
-      warning:
-        "Tell the user: memory search is paused because the memory index was built with a different embedding provider/model/settings.",
+      warning: `Tell the user: memory search is paused because the current memory configuration no longer matches the index (${reason}).`,
       action:
-        "Tell the user to run: openclaw memory status --index or openclaw memory index --force.",
+        "Tell the user to run: openclaw memory status --index --agent main. Rebuilding may call the configured embedding provider and can incur provider cost.",
     });
     expect(searchCalls).toBe(1);
     expect(getMemorySyncMockCalls()).toBe(0);
@@ -983,12 +998,14 @@ describe("memory_search corpus labels", () => {
         corpus: "sessions",
       });
 
-      expectUnavailableMemorySearchDetails(result.details, {
+      expect(result.details).toMatchObject({
         error: "Session transcript search is not enabled.",
         warning: "Session transcript search is unavailable for this agent.",
-        action:
-          'Enable memory.search.experimental.sessionMemory and add "sessions" to memory.search.sources, then retry memory_search.',
+        action: expect.stringContaining(
+          "If an exact session-history capability is available for this run",
+        ),
       });
+      expect((result.details as { action?: string }).action).not.toContain("sessions_search");
       expect(getMemorySearchManagerMockCalls()).toBe(0);
     },
   );
@@ -1019,6 +1036,8 @@ describe("memory_search corpus labels", () => {
         agentSessionKey: "agent:main:main",
       });
 
+      expect(tool.description).toContain("indexed session transcripts");
+      expect(tool.description).not.toContain("sessions_search");
       await tool.execute("ordinary-search", { query: "favorite food", corpus });
 
       expect(seenSources).toEqual(["sessions"]);

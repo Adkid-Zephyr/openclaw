@@ -2,6 +2,7 @@
 // Connects to a gateway and summarizes auth, health, status, and presence.
 import { randomUUID } from "node:crypto";
 import { gatewayOriginScope } from "../../packages/gateway-client/src/gateway-origin-scope.js";
+import { startGatewayClientWhenEventLoopReady } from "../../packages/gateway-client/src/readiness.js";
 import {
   GATEWAY_CLIENT_MODES,
   GATEWAY_CLIENT_NAMES,
@@ -18,8 +19,8 @@ import {
 } from "../infra/device-auth-store.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import type { SystemPresence } from "../infra/system-presence.js";
+import type { StatusSummary } from "../status/types.js";
 import { resolveSafeTimeoutDelayMs } from "../utils/timer-delay.js";
-import { startGatewayClientWhenEventLoopReady } from "./client-start-readiness.js";
 import {
   GatewayClient,
   GatewayClientRequestError,
@@ -78,7 +79,7 @@ export type GatewayProbeResult = {
   auth: GatewayProbeAuthSummary;
   server?: GatewayProbeServerSummary;
   health: unknown;
-  status: unknown;
+  status: Partial<StatusSummary> | null;
   presence: SystemPresence[] | null;
   configSnapshot: unknown;
 };
@@ -275,6 +276,7 @@ export async function probeGateway(opts: {
   detailLevel?: GatewayProbeDetailLevel;
   tlsFingerprint?: string;
   env?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
 }): Promise<GatewayProbeResult> {
   const startedAt = Date.now();
   const instanceId = randomUUID();
@@ -347,6 +349,7 @@ export async function probeGateway(opts: {
   return await new Promise<GatewayProbeResult>((resolve) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let onAbort: (() => void) | undefined;
     const startAbort = new AbortController();
     const clearProbeTimer = () => {
       if (timer) {
@@ -367,6 +370,10 @@ export async function probeGateway(opts: {
         return;
       }
       settled = true;
+      if (onAbort) {
+        opts.signal?.removeEventListener("abort", onAbort);
+        onAbort = undefined;
+      }
       startAbort.abort();
       clearProbeTimer();
       void (async () => {
@@ -400,7 +407,7 @@ export async function probeGateway(opts: {
       missingScopeErrorDetails?: MissingScopeErrorDetails;
       verifiedRead?: boolean;
       health: unknown;
-      status: unknown;
+      status: Partial<StatusSummary> | null;
       presence: SystemPresence[] | null;
       configSnapshot: unknown;
     }) => {
@@ -549,7 +556,7 @@ export async function probeGateway(opts: {
             }
             const [health, status, presence, configSnapshot] = await Promise.all([
               client.request("health"),
-              client.request("status"),
+              client.request<Partial<StatusSummary>>("status"),
               client.request("system-presence"),
               client.request("config.get", {}),
             ]);
@@ -578,6 +585,26 @@ export async function probeGateway(opts: {
         })();
       },
     });
+
+    if (opts.signal) {
+      onAbort = () => {
+        settleProbe({
+          ok: false,
+          error: "aborted",
+          health: null,
+          status: null,
+          presence: null,
+          configSnapshot: null,
+        });
+      };
+      opts.signal.addEventListener("abort", onAbort, { once: true });
+      if (opts.signal.aborted) {
+        onAbort();
+      }
+    }
+    if (settled) {
+      return;
+    }
 
     armProbeTimer(() => {
       const error = connectError ? `connect failed: ${connectError}` : "timeout";

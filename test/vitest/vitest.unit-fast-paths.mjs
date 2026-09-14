@@ -4,6 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { cliProcessTestFiles } from "./vitest.cli-process-paths.mjs";
 import { commandsLightTestFiles } from "./vitest.commands-light-paths.mjs";
+import { isDatabaseWorkerCoreTestFile } from "./vitest.database-worker-core-paths.mjs";
+import { gatewayPluginTestFiles } from "./vitest.gateway-server-paths.mjs";
 import { pluginSdkLightTestFiles } from "./vitest.plugin-sdk-paths.mjs";
 import { isToolingIsolatedTestFile } from "./vitest.tooling-isolated-paths.mjs";
 import { boundaryTestFiles, bundledPluginDependentUnitTestFiles } from "./vitest.unit-paths.mjs";
@@ -110,7 +112,6 @@ export const forcedUnitFastTestFiles = [
   "src/node-host/invoke-system-run.test.ts",
   "src/pairing/setup-code.test.ts",
   "src/plugin-activation-boundary.test.ts",
-  "src/plugin-sdk/memory-host-events.test.ts",
   "src/proxy-capture/runtime.test.ts",
   "src/proxy-capture/proxy-server.test.ts",
   "src/proxy-capture/store.sqlite.test.ts",
@@ -148,6 +149,7 @@ export const forcedUnitFastTestFiles = [
   "src/test-utils/temp-home.test.ts",
   "src/utils.test.ts",
   "src/version.test.ts",
+  "test/scripts/pr-ci-sweeper.reopen-timer.test.ts",
 ];
 const forcedUnitFastTestFileSet = new Set(forcedUnitFastTestFiles);
 const unitFastCandidateExactFiles = [...pluginSdkLightTestFiles, ...commandsLightTestFiles];
@@ -158,6 +160,7 @@ const broadUnitFastCandidateGlobs = [
   "test/**/*.test.ts",
 ];
 const ownerRoutedUnitTestPatterns = [
+  ...gatewayPluginTestFiles,
   ...cliProcessTestFiles,
   // Real Git process-tree fixtures stay in serial tooling even when their
   // subprocess harness moves into shared test support.
@@ -263,7 +266,7 @@ const disqualifyingPatterns = [
 ];
 
 const statefulTestHelperImportPattern =
-  /\bfrom\s+["']([^"']*(?:test-support|\.harness|prepared-model-runtime\.test-harness|message-action-runner\.test-helpers|computer-tool\.test-helpers)(?:\.js|\.ts)?)["']/gu;
+  /\bfrom\s+["']([^"']*(?:test-support|\.harness|\.test-mocks|prepared-model-runtime\.test-harness|message-action-runner\.test-helpers|computer-tool\.test-helpers)(?:\.js|\.ts)?)["']/gu;
 const statefulTestHelperByKey = new Map();
 
 function importsStatefulTestHelper(cwd, file, source) {
@@ -505,7 +508,9 @@ function analyzeUnitFastTestFile(cwd, file) {
   }
 
   let analysis;
-  if (isToolingIsolatedTestFile(file)) {
+  if (isDatabaseWorkerCoreTestFile(file)) {
+    analysis = { file, unitFast: false, reasons: ["database-worker-owner"] };
+  } else if (isToolingIsolatedTestFile(file)) {
     // Explicit project ownership wins over inferred eligibility so full-suite
     // configs cannot run the same stateful tooling test in two worker pools.
     analysis = {
@@ -559,11 +564,8 @@ export function collectUnitFastTestFileAnalysis(cwd = process.cwd(), options = {
 }
 
 let cachedUnitFastTestFiles = null;
-let cachedUnitFastTestFileSet = null;
 let cachedUnitFastIsolatedTestFiles = null;
-let cachedUnitFastIsolatedTestFileSet = null;
 let cachedUnitFastTimerTestFiles = null;
-let cachedUnitFastTimerTestFileSet = null;
 const scopedUnitFastTestFilesByKey = new Map();
 
 export function getUnitFastTestFilesForIncludePatterns(includePatterns, options = {}) {
@@ -630,12 +632,24 @@ function selectedUnitFastAnalysis(includePatterns) {
     : collectUnitFastTestFileAnalysis();
 }
 
+function isUnitFastTimerAnalysis(entry) {
+  return entry.unitFast && entry.reasons.includes("fake-timers");
+}
+
+function isUnitFastIsolatedAnalysis(entry) {
+  return (
+    entry.unitFast &&
+    !entry.reasons.includes("fake-timers") &&
+    (entry.forced || entry.reasons.includes("stateful-test-helper"))
+  );
+}
+
 export function getUnitFastTimerTestFiles(includePatterns) {
   if (!includePatterns && cachedUnitFastTimerTestFiles !== null) {
     return cachedUnitFastTimerTestFiles;
   }
   const files = selectedUnitFastAnalysis(includePatterns)
-    .filter((entry) => entry.unitFast && entry.reasons.includes("fake-timers"))
+    .filter(isUnitFastTimerAnalysis)
     .map((entry) => entry.file);
   return includePatterns ? files : (cachedUnitFastTimerTestFiles = files);
 }
@@ -645,50 +659,34 @@ export function getUnitFastIsolatedTestFiles(includePatterns) {
     return cachedUnitFastIsolatedTestFiles;
   }
   const files = selectedUnitFastAnalysis(includePatterns)
-    .filter(
-      (entry) =>
-        entry.unitFast &&
-        !entry.reasons.includes("fake-timers") &&
-        (entry.forced || entry.reasons.includes("stateful-test-helper")),
-    )
+    .filter(isUnitFastIsolatedAnalysis)
     .map((entry) => entry.file);
   return includePatterns ? files : (cachedUnitFastIsolatedTestFiles = files);
 }
 
-function getUnitFastTestFileSet() {
-  if (cachedUnitFastTestFileSet !== null) {
-    return cachedUnitFastTestFileSet;
-  }
-  cachedUnitFastTestFileSet = new Set(getUnitFastTestFiles());
-  return cachedUnitFastTestFileSet;
-}
-
-function getUnitFastTimerTestFileSet() {
-  if (cachedUnitFastTimerTestFileSet !== null) {
-    return cachedUnitFastTimerTestFileSet;
-  }
-  cachedUnitFastTimerTestFileSet = new Set(getUnitFastTimerTestFiles());
-  return cachedUnitFastTimerTestFileSet;
-}
-
-function getUnitFastIsolatedTestFileSet() {
-  if (cachedUnitFastIsolatedTestFileSet !== null) {
-    return cachedUnitFastIsolatedTestFileSet;
-  }
-  cachedUnitFastIsolatedTestFileSet = new Set(getUnitFastIsolatedTestFiles());
-  return cachedUnitFastIsolatedTestFileSet;
+function getUnitFastTestFileAnalysis(file) {
+  const normalized = normalizeRepoPath(file);
+  const cwd = process.cwd();
+  // Exact routing must not analyze every source before admitting one test.
+  // Retain inventory membership, including ignored-file and forced-owner rules.
+  return isUnitFastCandidateFile(normalized) &&
+    collectUnitFastCandidateInventory(cwd).includes(normalized)
+    ? analyzeUnitFastTestFile(cwd, normalized)
+    : undefined;
 }
 
 export function isUnitFastTestFile(file) {
-  return getUnitFastTestFileSet().has(normalizeRepoPath(file));
+  return getUnitFastTestFileAnalysis(file)?.unitFast ?? false;
 }
 
 export function isUnitFastTimerTestFile(file) {
-  return getUnitFastTimerTestFileSet().has(normalizeRepoPath(file));
+  const entry = getUnitFastTestFileAnalysis(file);
+  return entry ? isUnitFastTimerAnalysis(entry) : false;
 }
 
 export function isUnitFastIsolatedTestFile(file) {
-  return getUnitFastIsolatedTestFileSet().has(normalizeRepoPath(file));
+  const entry = getUnitFastTestFileAnalysis(file);
+  return entry ? isUnitFastIsolatedAnalysis(entry) : false;
 }
 
 export function resolveUnitFastTestIncludePattern(file) {

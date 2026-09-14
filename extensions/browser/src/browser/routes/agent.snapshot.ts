@@ -33,6 +33,7 @@ import {
   assertBrowserNavigationResultAllowed,
 } from "../navigation-guard.js";
 import { getBrowserProfileCapabilities } from "../profile-capabilities.js";
+import { getLoadedPwAiModule } from "../pw-ai-module.js";
 import { finalizeRoleSnapshot, type RoleRefMap } from "../pw-role-snapshot.js";
 import type { AnnotationItem } from "../screenshot-annotate.js";
 import { scaleAnnotations } from "../screenshot-annotate.js";
@@ -90,7 +91,7 @@ async function collectChromeMcpSnapshotUrls(
     fn: `() => {
       const seen = new Set();
       const out = [];
-      for (const anchor of Array.from(document.querySelectorAll("a[href]"))) {
+      for (const anchor of document.querySelectorAll("a[href]")) {
         const href = anchor.href || "";
         if (!href || seen.has(href)) continue;
         const text = (anchor.innerText || anchor.textContent || anchor.getAttribute("aria-label") || "")
@@ -352,7 +353,7 @@ export function registerBrowserAgentSnapshotRoutes(
       res,
       ctx,
       targetId,
-      run: async ({ profileCtx, tab, cdpUrl, signal }) => {
+      run: async ({ profileCtx, tab, cdpUrl, signal, assertCurrent }) => {
         if (getBrowserProfileCapabilities(profileCtx.profile).usesChromeMcp) {
           const ssrfPolicyOpts = browserNavigationPolicyForProfile(ctx, profileCtx);
           await assertBrowserNavigationAllowed({ url, ...ssrfPolicyOpts });
@@ -382,6 +383,7 @@ export function registerBrowserAgentSnapshotRoutes(
             targetId: tab.targetId,
             url,
             timeoutMs,
+            ...(assertCurrent ? { assertCurrent } : {}),
             ...(resolveRelayTarget
               ? {
                   resolveOperationTarget: resolveRelayTarget,
@@ -539,6 +541,7 @@ export function registerBrowserAgentSnapshotRoutes(
         let buffer: Buffer;
         const shouldUsePlaywright =
           labels ||
+          getLoadedPwAiModule()?.hasCachedPlaywrightBrowserConnection(cdpUrl) ||
           shouldUsePlaywrightForScreenshot({
             profile: profileCtx.profile,
             wsUrl: tab.wsUrl,
@@ -565,6 +568,7 @@ export function registerBrowserAgentSnapshotRoutes(
               fullPage,
               ref,
               element,
+              signal,
             });
             await saveNormalizedScreenshotResponse({
               res,
@@ -587,9 +591,11 @@ export function registerBrowserAgentSnapshotRoutes(
             fullPage,
             type,
             timeoutMs,
+            signal,
           });
           buffer = snap.buffer;
         } else {
+          const profileRuntime = ctx.state().profiles.get(profileCtx.profile.name);
           buffer = await captureScreenshot({
             wsUrl: tab.wsUrl ?? "",
             ...(tab.wsLookup ? { lookup: tab.wsLookup } : {}),
@@ -597,7 +603,9 @@ export function registerBrowserAgentSnapshotRoutes(
             format: type,
             quality: type === "jpeg" ? 85 : undefined,
             timeoutMs,
-            headless: ctx.state().profiles.get(profileCtx.profile.name)?.running?.headless,
+            headless:
+              profileRuntime?.running?.headless ??
+              (await profileRuntime?.externalBrowserMode?.headless),
           });
         }
 
@@ -637,6 +645,7 @@ export function registerBrowserAgentSnapshotRoutes(
       await runProfileRouteOperation({
         profileCtx,
         signal: req.signal,
+        assertCurrent: req.assertCurrent,
         run: async (signal) => {
           const tab = await profileCtx.ensureTabAvailable(targetId || undefined, {
             allowPlaywrightFallback: hasPlaywright,
@@ -650,6 +659,7 @@ export function registerBrowserAgentSnapshotRoutes(
               ...ssrfPolicyOpts,
             });
           }
+          await req.assertCurrent?.(profileCtx.profile);
           const deltaFamily: SnapshotDeltaFamily | undefined =
             plan.format === "ai"
               ? {
@@ -944,6 +954,7 @@ export function registerBrowserAgentSnapshotRoutes(
                 refs: "refs" in snap ? snap.refs : {},
                 type: "png",
                 timeoutMs: plan.timeoutMs,
+                signal,
               });
               const normalized = await normalizeBrowserScreenshot(labeled.buffer, {
                 maxSide: DEFAULT_BROWSER_SCREENSHOT_MAX_SIDE,

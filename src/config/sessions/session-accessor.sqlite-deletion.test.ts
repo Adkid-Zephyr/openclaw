@@ -11,7 +11,7 @@ import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import {
   markPluginRegistryActive,
   markPluginRegistryRetired,
-  revokePluginRecordLifecycleEpoch,
+  revokePluginRecord,
 } from "../../plugins/registry-lifecycle.js";
 import { withPluginRuntimeRegistryScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { createPluginRecord } from "../../plugins/status.test-helpers.js";
@@ -20,6 +20,8 @@ import {
   isCompetingSessionWorkAdmissionActive,
   isSessionWorkAdmissionActive,
 } from "../../sessions/session-lifecycle-admission.js";
+import { onSessionIdentityMutation } from "../../sessions/session-lifecycle-events.js";
+import * as personalPublicationLifecycle from "../../state/github-personal-publication-lifecycle.js";
 import {
   closeOpenClawAgentDatabasesForTest,
   deferOpenClawAgentPostCommitPublication,
@@ -410,6 +412,32 @@ describe("session deletion and native owner state", () => {
     expect(bindings.has(sessionKey)).toBe(false);
   });
 
+  it("publishes committed deletion when personal publication receipt cleanup fails", async () => {
+    await seed();
+    const owner = nativeOwner();
+    const cleanupError = new Error("injected receipt cleanup failure");
+    vi.spyOn(
+      personalPublicationLifecycle,
+      "deletePersonalGitHubSessionReceipts",
+    ).mockImplementationOnce(() => {
+      throw cleanupError;
+    });
+    const identityListener = vi.fn();
+    const unsubscribe = onSessionIdentityMutation(identityListener);
+
+    try {
+      await expect(owner.run(() => remove())).rejects.toBe(cleanupError);
+
+      expect(read()).toBeUndefined();
+      expect(bindings.has(sessionKey)).toBe(false);
+      expect(identityListener.mock.calls).toEqual([
+        [{ agentId: "main", kind: "delete", previous: { sessionId, sessionKeys: [sessionKey] } }],
+      ]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
   it.each([false, true])(
     "compensates partial commits even when another rollback fails (%s)",
     async (rollbackFails) => {
@@ -489,20 +517,26 @@ describe("session deletion and native owner state", () => {
     },
   );
 
-  it("uses an explicitly scoped prepared registry without globally activating it", async () => {
-    await seed();
-    let retainedGuard: (() => void) | undefined;
-    const owner = nativeOwner({
-      activate: false,
-      prepare: async ({ assertCurrent }) => {
-        retainedGuard = assertCurrent;
-      },
-    });
-    await owner.run(() => remove());
-    expect(read()).toBeUndefined();
-    expect(bindings.has(sessionKey)).toBe(false);
-    expect(() => retainedGuard?.()).toThrow("harness owner changed");
-  });
+  it.each(["scoped", "published during preparation"] as const)(
+    "uses the exact prepared owner while %s",
+    async (publication) => {
+      await seed();
+      let retainedGuard: (() => void) | undefined;
+      const owner = nativeOwner({
+        activate: false,
+        prepare: async ({ assertCurrent }) => {
+          retainedGuard = assertCurrent;
+          if (publication === "published during preparation") {
+            markPluginRegistryActive(owner.registry);
+          }
+        },
+      });
+      await owner.run(() => remove());
+      expect(read()).toBeUndefined();
+      expect(bindings.has(sessionKey)).toBe(false);
+      expect(() => retainedGuard?.()).toThrow("harness owner changed");
+    },
+  );
 
   it.each(["retired", "reactivated", "record revoked", "registration replaced"] as const)(
     "rejects a prepared owner after its registry is %s",
@@ -523,9 +557,10 @@ describe("session deletion and native owner state", () => {
       if (change === "retired") {
         markPluginRegistryRetired(owner.registry);
       } else if (change === "reactivated") {
+        markPluginRegistryRetired(owner.registry);
         markPluginRegistryActive(owner.registry);
       } else if (change === "record revoked") {
-        revokePluginRecordLifecycleEpoch(owner.registry, owner.record);
+        revokePluginRecord(owner.registry, owner.record);
       } else {
         owner.registry.agentHarnesses = owner.registry.agentHarnesses.map((registration) =>
           Object.assign({}, registration),

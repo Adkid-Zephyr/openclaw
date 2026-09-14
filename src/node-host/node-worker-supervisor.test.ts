@@ -466,6 +466,9 @@ describe("node worker supervisor", () => {
       HOME: path.join(root, "worker-home"),
       LANG: "en_US.UTF-8",
       LC_TIME: "de_DE.UTF-8",
+      DISPLAY: ":99",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/fixture/bus",
+      XDG_RUNTIME_DIR: path.join(root, "desktop-runtime"),
       NODE_COMPILE_CACHE: path.join(root, "host-compile-cache"),
       NODE_DISABLE_COMPILE_CACHE: "1",
       NODE_EXTRA_CA_CERTS: path.join(root, "private-ca.pem"),
@@ -493,6 +496,9 @@ describe("node worker supervisor", () => {
           HOME: suppliedEnv.HOME,
           LANG: suppliedEnv.LANG,
           LC_TIME: suppliedEnv.LC_TIME,
+          DISPLAY: suppliedEnv.DISPLAY,
+          DBUS_SESSION_BUS_ADDRESS: suppliedEnv.DBUS_SESSION_BUS_ADDRESS,
+          XDG_RUNTIME_DIR: suppliedEnv.XDG_RUNTIME_DIR,
           NODE_EXTRA_CA_CERTS: suppliedEnv.NODE_EXTRA_CA_CERTS,
           NODE_USE_SYSTEM_CA: suppliedEnv.NODE_USE_SYSTEM_CA,
           NODE_COMPILE_CACHE: expect.stringContaining("node-worker-compile-cache"),
@@ -525,15 +531,22 @@ describe("node worker supervisor", () => {
         expect(workerEnv).not.toHaveProperty("HTTPS_PROXY");
         expect(workerEnv).not.toHaveProperty("SUPPLIED_SECRET");
         expect(JSON.stringify(workerEnv)).not.toContain(TEST_WORKER_CREDENTIAL);
-        const platformInjectedKeys =
-          process.platform === "darwin" ? ["__CF_USER_TEXT_ENCODING"] : [];
-        expect(Object.keys(workerEnv).toSorted()).toEqual(
-          [...Object.keys(expectedWorkerEnv), ...platformInjectedKeys]
-            .filter(
-              (key) => expectedWorkerEnv[key] !== undefined || platformInjectedKeys.includes(key),
-            )
+        const platformInjectedKeys = new Set(
+          process.platform === "darwin" ? ["__CF_USER_TEXT_ENCODING"] : [],
+        );
+        expect(
+          Object.keys(workerEnv)
+            .filter((key) => !platformInjectedKeys.has(key))
+            .toSorted(),
+        ).toEqual(
+          Object.keys(expectedWorkerEnv)
+            .filter((key) => expectedWorkerEnv[key] !== undefined)
             .toSorted(),
         );
+        if (workerEnv["__CF_USER_TEXT_ENCODING"] !== undefined) {
+          expect(process.platform).toBe("darwin");
+          expect(workerEnv["__CF_USER_TEXT_ENCODING"]).toBeTypeOf("string");
+        }
         await supervisor.close();
       },
     );
@@ -542,6 +555,11 @@ describe("node worker supervisor", () => {
   it("bounds output and scrubs launch credentials after registry eviction", async () => {
     const { supervisor, workspaceDir } = fixture();
     const successInput = launchInput(workspaceDir, "secret-success-launch", "secret-success");
+    successInput.descriptor.assignment.github = {
+      token: "worker-github-token",
+      login: "worker-bot",
+      branch: "session/worker-1",
+    };
     const failureInput = launchInput(workspaceDir, "failure-launch", "secret-fail");
     const overflowInput = launchInput(workspaceDir, "overflow-launch", "overflow");
 
@@ -549,8 +567,9 @@ describe("node worker supervisor", () => {
     await supervisor.launch(successInput, TEST_WORKER_ENDPOINT);
     await supervisor.launch(failureInput, TEST_WORKER_ENDPOINT);
     await supervisor.launch(overflowInput, TEST_WORKER_ENDPOINT);
-    expect(registrations).toHaveBeenCalledTimes(3);
+    expect(registrations).toHaveBeenCalledTimes(4);
     expect(registrations).toHaveBeenCalledWith(TEST_WORKER_CREDENTIAL);
+    expect(registrations).toHaveBeenCalledWith(successInput.descriptor.assignment.github.token);
     const success = await waitForTerminal(supervisor, successInput.launchId);
     const failure = await waitForTerminal(supervisor, failureInput.launchId);
     const overflow = await waitForTerminal(supervisor, overflowInput.launchId);
@@ -558,11 +577,12 @@ describe("node worker supervisor", () => {
       TEST_WORKER_CREDENTIAL,
       encodeURIComponent(TEST_WORKER_CREDENTIAL),
       JSON.stringify(TEST_WORKER_CREDENTIAL).slice(1, -1),
+      successInput.descriptor.assignment.github.token,
     ];
     expect(success.state).toBe("completed");
     expect(JSON.parse(success.resultJson ?? "null")).toEqual({
       status: "completed",
-      transcriptLeafId: "raw [REDACTED] encoded [REDACTED]",
+      transcriptLeafId: "raw [REDACTED] encoded [REDACTED] github [REDACTED]",
       transcriptNextSeq: 2,
     });
     expect(failure.state).toBe("failed");
@@ -604,6 +624,11 @@ describe("node worker supervisor", () => {
     const first = testWorkerLaunchInput(workspaceDir, "previous-diagnostic", "diagnostic-retain");
     const second = testWorkerLaunchInput(workspaceDir, "rotated-credential", "secret-success");
     second.descriptor.admission.credential = 'fresh worker/"credential\\secret?';
+    second.descriptor.assignment.github = {
+      token: "rotated-worker-github-token",
+      login: "worker-bot",
+      branch: "session/worker-1",
+    };
     const last = testWorkerLaunchInput(workspaceDir, "fresh-failure", "quiet-fail");
     last.descriptor.admission.credential = "final-worker-credential";
     try {
@@ -614,10 +639,11 @@ describe("node worker supervisor", () => {
         worker: original.worker,
       });
       expect(registrations).toHaveBeenCalledWith(second.descriptor.admission.credential);
+      expect(registrations).toHaveBeenCalledWith(second.descriptor.assignment.github.token);
       const completed = await waitForTerminal(supervisor, second.launchId);
       expect(JSON.parse(completed.resultJson ?? "null")).toEqual({
         status: "completed",
-        transcriptLeafId: "raw [REDACTED] encoded [REDACTED]",
+        transcriptLeafId: "raw [REDACTED] encoded [REDACTED] github [REDACTED]",
         transcriptNextSeq: 2,
       });
 

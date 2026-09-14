@@ -5,7 +5,7 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { retireSessionMcpRuntime } from "../../agents/agent-bundle-mcp-tools.js";
-import { resolveSessionAgentId } from "../../agents/agent-scope.js";
+import { resolveAgentWorkspaceDir, resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { clearBootstrapSnapshotOnSessionBoundary } from "../../agents/bootstrap-cache.js";
 import { clearAllCliSessions, getCliSessionBinding } from "../../agents/cli-session.js";
 import { resetRegisteredAgentHarnessSessions } from "../../agents/harness/registry.js";
@@ -98,6 +98,7 @@ import {
   classifySessionStateActor,
   registerMainSessionGroupWatch,
 } from "../../sessions/session-state-events.js";
+import { assertPreparedSkillLibrarySelection } from "../../skills/library/selection.js";
 import {
   deliveryContextFromSession,
   normalizeSessionDeliveryState,
@@ -114,6 +115,7 @@ import type {
 import { resolveEffectiveResetTargetSessionKey } from "./acp-reset-target.js";
 import { readBeforeResetMessages } from "./commands-reset-hooks.js";
 import { resolveConversationBindingContextFromMessage } from "./conversation-binding-input.js";
+import { shouldBypassAcpDispatchForCommand } from "./dispatch-acp-command-bypass.js";
 import { normalizeInboundTextNewlines } from "./inbound-text.js";
 import { replyRunRegistry } from "./reply-run-registry.js";
 import { resolveRuntimePolicySessionKey } from "./runtime-policy-session-key.js";
@@ -134,7 +136,11 @@ import {
   canReplaceRestartTombstoneFromParent,
   prepareReplySessionParentFork,
 } from "./session-parent-fork-prepare.js";
-import { clearSessionResetRuntimeState } from "./session-reset-cleanup.js";
+import {
+  clearSessionResetRuntimeState,
+  createSessionResetCleanupGuard,
+  stopSessionResetSubagents,
+} from "./session-reset-cleanup.js";
 import { resolveAuthorizedSessionResetCommand } from "./session-reset-command.js";
 import {
   stripThreadFromSessionRoute,
@@ -230,13 +236,20 @@ type InitSessionStateAttemptContext = {
   conversationBindingContext: ReturnType<typeof resolveSessionConversationBindingContext>;
   isSystemEvent: boolean;
   retargetedSession: boolean;
+  sessionKey: string;
   sessionCtxForState: FinalizedRuntimeMsgContext;
   storePath: string;
 };
 
 type InitSessionStateAttemptOutcome =
   | { kind: "complete"; result: SessionInitResult }
-  | { kind: "lifecycle-mutation"; sessionId: string; sessionKey: string };
+  | {
+      kind: "lifecycle-mutation";
+      sessionId: string;
+      sessionKey: string;
+      lifecycleRevision?: string;
+      resetTriggered: boolean;
+    };
 
 function resolveSessionConversationBindingContext(
   cfg: OpenClawConfig,
@@ -266,7 +279,7 @@ function resolveSessionConversationBindingContext(
 
 function resolveBoundConversationSessionKey(params: {
   cfg: OpenClawConfig;
-  ctx: MsgContext;
+  ctx: FinalizedRuntimeMsgContext;
   touch?: boolean;
   bindingContext?: {
     channel: string;
@@ -296,8 +309,16 @@ function resolveBoundConversationSessionKey(params: {
   if (params.touch !== false) {
     getSessionBindingService().touch(binding.bindingId, undefined, binding.conversation);
   }
-  // Plugins own their target handoff; escaped commands still initialize the core session.
-  return isPluginOwnedSessionBindingRecord(binding) ? undefined : binding.targetSessionKey;
+  // Escaped ACP commands run under the source model owner. Their handlers resolve
+  // the bound target separately; initialization must not mix that key with the source owner.
+  if (
+    isPluginOwnedSessionBindingRecord(binding) ||
+    (isAcpSessionKey(binding.targetSessionKey) &&
+      shouldBypassAcpDispatchForCommand(params.ctx, params.cfg))
+  ) {
+    return undefined;
+  }
+  return binding.targetSessionKey;
 }
 
 function resolveInitSessionStateAttemptContext(
@@ -335,6 +356,16 @@ function resolveInitSessionStateAttemptContext(
     conversationBindingContext,
     isSystemEvent,
     retargetedSession: sessionCtxForState !== ctx,
+    sessionKey: canonicalizeMainSessionAlias({
+      cfg,
+      agentId,
+      sessionKey: resolveSessionKey(
+        cfg.session?.scope ?? "per-sender",
+        sessionCtxForState,
+        normalizeMainKey(cfg.session?.mainKey),
+        agentId,
+      ),
+    }),
     sessionCtxForState,
     storePath: resolveSessionStorePathForScope({
       agentId,
@@ -357,16 +388,7 @@ export function resolveReplySessionPreprocessingState(
   const attemptContext = resolveInitSessionStateAttemptContext(params, {
     touchConversationBinding: false,
   });
-  const sessionKey = canonicalizeMainSessionAlias({
-    cfg: params.cfg,
-    agentId: attemptContext.agentId,
-    sessionKey: resolveSessionKey(
-      params.cfg.session?.scope ?? "per-sender",
-      attemptContext.sessionCtxForState,
-      normalizeMainKey(params.cfg.session?.mainKey),
-      attemptContext.agentId,
-    ),
-  });
+  const { sessionKey } = attemptContext;
   const sessionEntry = loadReplySessionInitializationSnapshot({
     agentId: attemptContext.agentId,
     storePath: attemptContext.storePath,
@@ -420,6 +442,7 @@ function resolveReplySessionRolloverState(
     authProfileOverrideSource: preservedSelection.authProfileOverrideSource,
     authProfileOverrideCompactionCount: preservedSelection.authProfileOverrideCompactionCount,
     label: entry.label,
+    autoLabel: entry.autoLabel,
     displayName: entry.displayName,
     // Notice debt survives rollover: erasing it here would recreate the
     // silent ambiguous-loss outcome the debt exists to prevent.
@@ -458,6 +481,39 @@ async function initSessionStateAttempt(
   staleSnapshotRetried: boolean,
 ): Promise<SessionInitResult> {
   const attemptContext = resolveInitSessionStateAttemptContext(params);
+  const parentSessionKey = normalizeOptionalString(params.ctx.ParentSessionKey);
+  const snapshot = loadReplySessionInitializationSnapshot({
+    agentId: attemptContext.agentId,
+    storePath: attemptContext.storePath,
+    sessionKey: attemptContext.sessionKey,
+    relatedSessionKeys: parentSessionKey ? [parentSessionKey] : [],
+  });
+  const { restoreSessionColdTranscript } =
+    await import("../../config/sessions/session-cold-storage.js");
+  const restoreTargets = [
+    { sessionId: snapshot.currentEntry?.sessionId, sessionKey: attemptContext.sessionKey },
+    ...(parentSessionKey
+      ? [
+          {
+            sessionId: snapshot.readEntry(parentSessionKey)?.sessionId,
+            sessionKey: parentSessionKey,
+          },
+        ]
+      : []),
+  ];
+  // Restore before the writer lane: reset hooks and parent forks read synchronously inside it.
+  for (const target of restoreTargets) {
+    if (target.sessionId) {
+      params.signal?.throwIfAborted();
+      await restoreSessionColdTranscript({
+        ...target,
+        sessionId: target.sessionId,
+        agentId: attemptContext.agentId,
+        storePath: attemptContext.storePath,
+      });
+    }
+  }
+  params.signal?.throwIfAborted();
   // Guarded revision checks only serialize correctly when the snapshot and
   // commit share the same writer lane.
   const attempt = await runExclusiveSessionStoreWrite(
@@ -483,16 +539,24 @@ async function initSessionStateAttempt(
       prepare: async () => {
         // A queued rollover may change identity or become obsolete. Recheck
         // before interrupting, then reacquire any refreshed identity first.
-        const revalidated = await runExclusiveSessionStoreWrite(
-          attemptContext.storePath,
-          async () => await initSessionStateAttemptLocked(params, attemptContext, false, undefined),
-        );
-        if (
-          revalidated.kind === "complete" ||
-          revalidated.sessionKey !== candidate.sessionKey ||
-          revalidated.sessionId !== candidate.sessionId
-        ) {
-          preparedOutcome = revalidated;
+        const revalidate = async () => {
+          const revalidated = await runExclusiveSessionStoreWrite(
+            attemptContext.storePath,
+            async () =>
+              await initSessionStateAttemptLocked(params, attemptContext, false, undefined),
+          );
+          if (
+            revalidated.kind === "complete" ||
+            revalidated.sessionKey !== candidate.sessionKey ||
+            revalidated.sessionId !== candidate.sessionId ||
+            revalidated.lifecycleRevision !== candidate.lifecycleRevision
+          ) {
+            preparedOutcome = revalidated;
+            return undefined;
+          }
+          return revalidated;
+        };
+        if (!(await revalidate())) {
           return;
         }
         const drained = await interruptSessionWorkAdmissions({
@@ -504,6 +568,24 @@ async function initSessionStateAttempt(
           throw new Error(
             `timed out draining work before reply session rollover: ${candidate.sessionKey}`,
           );
+        }
+        // A draining owner can rebind the parent. Reacquire and drain that identity
+        // before selecting any child work associated with the session.
+        const afterDrain = await revalidate();
+        if (afterDrain?.resetTriggered) {
+          // Child finalizers may need the same store writer. Drain them here,
+          // outside that lane, before an explicit reset can commit or run its tail.
+          await stopSessionResetSubagents({
+            cfg: params.cfg,
+            sessionKey: candidate.sessionKey,
+            agentId: attemptContext.agentId,
+            assertCurrent: createSessionResetCleanupGuard({
+              sessionKey: candidate.sessionKey,
+              storePath: attemptContext.storePath,
+              expectedSession: afterDrain,
+              assertCurrent: () => params.signal?.throwIfAborted(),
+            }),
+          });
         }
       },
       run: async () => {
@@ -529,7 +611,9 @@ async function initSessionStateAttemptLocked(
   params: InitSessionStateParams,
   attemptContext: InitSessionStateAttemptContext,
   staleSnapshotRetried: boolean,
-  lifecycleMutationIdentity: { sessionId: string; sessionKey: string } | undefined,
+  lifecycleMutationIdentity:
+    | { sessionId: string; sessionKey: string; lifecycleRevision?: string }
+    | undefined,
 ): Promise<InitSessionStateAttemptOutcome> {
   const { ctx, cfg, commandAuthorized } = params;
   const {
@@ -537,6 +621,7 @@ async function initSessionStateAttemptLocked(
     conversationBindingContext,
     isSystemEvent,
     retargetedSession,
+    sessionKey,
     sessionCtxForState,
     storePath,
   } = attemptContext;
@@ -575,12 +660,6 @@ async function initSessionStateAttemptLocked(
     resetTriggered = true;
   }
 
-  // Canonicalize so the written key matches what all read paths produce.
-  const sessionKey: string = canonicalizeMainSessionAlias({
-    cfg,
-    agentId,
-    sessionKey: resolveSessionKey(sessionScope, sessionCtxForState, mainKey, agentId),
-  });
   // CRITICAL: Skip cache to ensure fresh data when resolving session identity.
   // Stale cache (especially with multiple gateway processes or on Windows where
   // mtime granularity may miss rapid writes) can cause incorrect sessionId
@@ -766,13 +845,14 @@ async function initSessionStateAttemptLocked(
     !freshEntry &&
     canReuseExistingEntry &&
     entryFreshness?.fresh === false &&
-    entryFreshness.staleReason != null &&
     activeReplyOperation?.phase !== "queued" &&
     activeReplyOperation?.sessionId === entry?.sessionId;
-  // Implicit daily/idle rollover must not rename a transcript while that exact
-  // session's active writer is still running. Admission will steer/wait/queue;
-  // queued pre-dispatch reservations still let the current turn roll over.
+  // An implicit reset must not append a boundary or interrupt this exact active writer.
+  // A bare stale result is the legacy updatedAt=0 pending-reset tombstone.
   const effectiveFreshEntry = deferImplicitRolloverForActiveRun ? true : freshEntry;
+  // Keep the owed reset pending until the active writer completes.
+  const retainPendingResetMarker =
+    deferImplicitRolloverForActiveRun && !isNewSession && entry?.updatedAt === 0;
   // Capture the current session entry before any reset so its transcript can be
   // archived afterward.  We need to do this for both explicit resets (/new, /reset)
   // and for scheduled/daily resets where the session has become stale (!freshEntry).
@@ -788,13 +868,16 @@ async function initSessionStateAttemptLocked(
   const lifecycleMutationMatches = Boolean(
     previousSessionEntry &&
     lifecycleMutationIdentity?.sessionKey === sessionKey &&
-    lifecycleMutationIdentity.sessionId === previousSessionEntry.sessionId,
+    lifecycleMutationIdentity.sessionId === previousSessionEntry.sessionId &&
+    lifecycleMutationIdentity.lifecycleRevision === previousSessionEntry.lifecycleRevision,
   );
   if (previousSessionEntry && !lifecycleMutationMatches) {
     return {
       kind: "lifecycle-mutation",
       sessionId: previousSessionEntry.sessionId,
       sessionKey,
+      lifecycleRevision: previousSessionEntry.lifecycleRevision,
+      resetTriggered,
     };
   }
   const recoveredTerminalEntry =
@@ -916,7 +999,7 @@ async function initSessionStateAttemptLocked(
     ...creationStamp,
     sessionId,
     lifecycleRevision: isNewSession ? crypto.randomUUID() : baseEntry?.lifecycleRevision,
-    updatedAt: Date.now(),
+    updatedAt: retainPendingResetMarker ? 0 : Date.now(),
     sessionStartedAt: isNewSession
       ? now
       : (baseEntry?.sessionStartedAt ?? lifecycleTimestamps.sessionStartedAt),
@@ -940,6 +1023,7 @@ async function initSessionStateAttemptLocked(
     delivery,
     groupId: baseEntry?.groupId,
     subject: baseEntry?.subject,
+    topicName: baseEntry?.topicName,
     groupChannel: baseEntry?.groupChannel,
     space: baseEntry?.space,
     groupActivation: entry?.groupActivation,
@@ -969,7 +1053,8 @@ async function initSessionStateAttemptLocked(
     sessionEntry.chatType = "direct";
   }
   const threadLabel = normalizeOptionalString(ctx.ThreadLabel);
-  if (threadLabel) {
+  // Derived labels initialize titles; channel renames and generated titles own later changes.
+  if (threadLabel && !sessionEntry.displayName) {
     sessionEntry.displayName = threadLabel;
   }
   const alreadyForked = sessionEntryForkedFromParent(sessionEntry);
@@ -1021,6 +1106,12 @@ async function initSessionStateAttemptLocked(
   let previousSessionMemory: SessionMemoryTranscript | undefined;
   let previousSessionResetMessages: unknown[] | undefined;
   const committed = await commitReplySessionInitialization({
+    commitGuard: !entry
+      ? () => {
+          params.signal?.throwIfAborted();
+          assertPreparedSkillLibrarySelection(ctx.SessionCreation?.skillLibrarySelections);
+        }
+      : undefined,
     activeSessionKey: sessionKey,
     agentId,
     archivePreviousTranscript: false,
@@ -1056,7 +1147,9 @@ async function initSessionStateAttemptLocked(
         warn: (message) => log.warn(message),
       });
     },
-    ...(resetBoundary ? { resetBoundary } : {}),
+    ...(resetBoundary
+      ? { resetBoundary: { ...resetBoundary, cwd: resolveAgentWorkspaceDir(cfg, agentId) } }
+      : {}),
     beforeEntryMutation: async ({ currentEntry, sessionEntry: entryToCommit }) => {
       if (!previousSessionEntry || !currentEntry) {
         return;

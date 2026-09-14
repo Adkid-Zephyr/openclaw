@@ -81,9 +81,17 @@ function createWorkspaceReadBridge(workspaceDir: string) {
 }
 
 describe("remote sandbox fs bridge", () => {
-  it.runIf(process.platform !== "win32")(
-    "preserves binary payloads, quoted paths, empty files, and exclusive creates without a host mirror",
-    async () => {
+  it.runIf(process.platform !== "win32").each([
+    { workspaceAccess: "rw", mutation: "write" },
+    { workspaceAccess: "none", mutation: "write" },
+    { workspaceAccess: "ro", mutation: "write" },
+    { workspaceAccess: "rw", mutation: "remove" },
+    { workspaceAccess: "none", mutation: "remove" },
+    { workspaceAccess: "rw", mutation: "rename" },
+    { workspaceAccess: "none", mutation: "rename" },
+  ] as const)(
+    "enforces $workspaceAccess workspace writes and protects remote-only skills from $mutation",
+    async ({ workspaceAccess, mutation }) => {
       await withTempDir("openclaw-remote-fs-payload-", async (stateDir) => {
         const workspaceDir = path.join(await fs.realpath(stateDir), "host-workspace");
         const remoteWorkspaceDir = path.join(await fs.realpath(stateDir), "remote 'workspace'");
@@ -94,15 +102,34 @@ describe("remote sandbox fs bridge", () => {
           remoteAgentWorkspaceDir: remoteWorkspaceDir,
         });
         const bridge = createRemoteShellSandboxFsBridge({
-          sandbox: createSandbox({ workspaceDir, agentWorkspaceDir: workspaceDir }),
+          sandbox: createSandbox({
+            workspaceDir,
+            agentWorkspaceDir: workspaceDir,
+            workspaceAccess,
+          }),
           runtime,
         });
         const filePath = "quoted ' \" $() `literal`.bin";
         const payload = Buffer.from([0, 255, 128, 10, 13, 39, 34, 36, 96]);
         const createFileExclusive = bridge.createFileExclusive!.bind(bridge);
+        if (!bridge.readDirectory) {
+          throw new Error("The remote bridge must support directory discovery.");
+        }
+        await expect(bridge.readDirectory({ filePath: "." })).resolves.toEqual([]);
+        await expect(bridge.readDirectory({ filePath: "../" })).rejects.toThrow();
+        if (workspaceAccess === "ro") {
+          await expect(createFileExclusive({ filePath, data: payload })).rejects.toThrow(
+            "read-only",
+          );
+          await expect(fs.readdir(remoteWorkspaceDir)).resolves.toEqual([]);
+          return;
+        }
 
         await expect(createFileExclusive({ filePath, data: payload })).resolves.toBe("created");
         await expect(bridge.readFile({ filePath })).resolves.toEqual(payload);
+        await expect(bridge.readDirectory({ filePath: "." })).resolves.toEqual([
+          { name: filePath, isDirectory: false },
+        ]);
         await expect(
           createFileExclusive({ filePath, data: Buffer.alloc(1_048_576) }),
         ).resolves.toBe("exists");
@@ -118,6 +145,19 @@ describe("remote sandbox fs bridge", () => {
           Buffer.alloc(0),
         );
         await expect(fs.readdir(workspaceDir)).resolves.toEqual([]);
+        const skillRelativePath =
+          mutation === "write" ? "skills/demo/SKILL.md" : ".agents/skills/demo/SKILL.md";
+        const skillPath = path.join(remoteWorkspaceDir, skillRelativePath);
+        await fs.mkdir(path.dirname(skillPath), { recursive: true });
+        await fs.writeFile(skillPath, "managed instructions");
+        const mutate =
+          mutation === "write"
+            ? bridge.writeFile({ filePath: skillRelativePath, data: "changed" })
+            : mutation === "remove"
+              ? bridge.remove({ filePath: ".agents", recursive: true })
+              : bridge.rename({ from: ".agents", to: "moved-instructions" });
+        await expect(mutate).rejects.toThrow("read-only");
+        await expect(fs.readFile(skillPath, "utf8")).resolves.toBe("managed instructions");
       });
     },
   );
@@ -483,6 +523,9 @@ describe.runIf(process.platform === "linux")("remote sandbox fs bridge (GNU shel
       await expect(
         createFileExclusive!({ filePath: "escape/outside.txt", data: "blocked" }),
       ).rejects.toThrow(/escapes allowed mounts/);
+      await expect(bridge.mkdirp({ filePath: "escape/dir" })).rejects.toThrow(
+        /escapes allowed mounts/,
+      );
     });
   });
 
@@ -628,6 +671,121 @@ describe.runIf(process.platform === "linux")("remote sandbox fs bridge (GNU shel
       );
     });
   });
+
+  it.runIf(process.platform !== "win32")(
+    "authorizes logical policy paths and pins physical canonical destinations with observed final effects",
+    async () => {
+      await withTempDir("openclaw-remote-fs-pinned-", async (stateDir) => {
+        const hostWorkspaceDir = path.join(await fs.realpath(stateDir), "host-workspace");
+        const realWorkspaceDir = path.join(await fs.realpath(stateDir), "real-workspace");
+        const linkedWorkspaceDir = path.join(await fs.realpath(stateDir), "linked-workspace");
+        await fs.mkdir(hostWorkspaceDir);
+        await fs.mkdir(realWorkspaceDir);
+        // The remote-visible workspace root is itself an alias: policy grants
+        // use the logical namespace while canonicalization resolves to the
+        // physical root.
+        await fs.symlink(realWorkspaceDir, linkedWorkspaceDir);
+        const { runtime } = createLocalRemoteRuntime({
+          remoteWorkspaceDir: linkedWorkspaceDir,
+          remoteAgentWorkspaceDir: linkedWorkspaceDir,
+        });
+        const bridge = createRemoteShellSandboxFsBridge({
+          sandbox: createSandbox({
+            workspaceDir: hostWorkspaceDir,
+            agentWorkspaceDir: hostWorkspaceDir,
+          }),
+          runtime,
+        });
+
+        const realDir = path.join(realWorkspaceDir, "real");
+        const decoyDir = path.join(realWorkspaceDir, "decoy");
+        await fs.mkdir(realDir);
+        await fs.mkdir(decoyDir);
+        await fs.symlink(realDir, path.join(linkedWorkspaceDir, "alias"));
+        await fs.writeFile(path.join(linkedWorkspaceDir, "source.txt"), "copy-source");
+
+        // The policy view stays in the logical namespace; the pin resolves to
+        // the physical canonical destination.
+        const writeTarget = await bridge.resolvePinnedMutationTarget!({
+          filePath: "note.txt",
+          action: "write",
+        });
+        expect(writeTarget.policyPath).toBe(path.join(linkedWorkspaceDir, "note.txt"));
+        expect(writeTarget.pinnedPath).toBe(path.join(realWorkspaceDir, "note.txt"));
+        await bridge.writeFile({
+          filePath: "note.txt",
+          data: "pinned",
+          pinnedPath: writeTarget.pinnedPath,
+        });
+        await expect(fs.readFile(path.join(realWorkspaceDir, "note.txt"), "utf8")).resolves.toBe(
+          "pinned",
+        );
+
+        // Post-authorization alias swap: the pinned write cannot be redirected.
+        const aliasTarget = await bridge.resolvePinnedMutationTarget!({
+          filePath: "alias/note.txt",
+          action: "write",
+        });
+        expect(aliasTarget.pinnedPath).toBe(path.join(realDir, "note.txt"));
+        await fs.unlink(path.join(linkedWorkspaceDir, "alias"));
+        await fs.symlink(decoyDir, path.join(linkedWorkspaceDir, "alias"));
+        await bridge.writeFile({
+          filePath: "alias/note.txt",
+          data: "after-swap",
+          pinnedPath: aliasTarget.pinnedPath,
+        });
+        await expect(fs.readFile(path.join(realDir, "note.txt"), "utf8")).resolves.toBe(
+          "after-swap",
+        );
+        await expect(fs.stat(path.join(decoyDir, "note.txt"))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+
+        // Restore the alias, then remove exactly the authorized entry.
+        await fs.unlink(path.join(linkedWorkspaceDir, "alias"));
+        await fs.symlink(realDir, path.join(linkedWorkspaceDir, "alias"));
+        await fs.writeFile(path.join(realDir, "gone.txt"), "remove-me");
+        await fs.writeFile(path.join(realDir, "keep.txt"), "keep-me");
+        const removeTarget = await bridge.resolvePinnedMutationTarget!({
+          filePath: "alias/gone.txt",
+          action: "remove",
+        });
+        expect(removeTarget.pinnedPath).toBe(path.join(realDir, "gone.txt"));
+        await bridge.remove({
+          filePath: "alias/gone.txt",
+          force: true,
+          pinnedPath: removeTarget.pinnedPath,
+        });
+        await expect(fs.stat(path.join(realDir, "gone.txt"))).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await expect(fs.readFile(path.join(realDir, "keep.txt"), "utf8")).resolves.toBe("keep-me");
+
+        // Directory creation through an alias: the directory pin follows the
+        // canonical directory even when the alias renames it.
+        const mkdirTarget = await bridge.resolvePinnedMutationTarget!({
+          filePath: "alias/newdir",
+          action: "mkdir",
+        });
+        expect(mkdirTarget.policyPath).toBe(path.join(linkedWorkspaceDir, "real", "newdir"));
+        expect(mkdirTarget.pinnedPath).toBe(path.join(realWorkspaceDir, "real", "newdir"));
+        await bridge.mkdirp({ filePath: "alias/newdir", pinnedPath: mkdirTarget.pinnedPath });
+        expect((await fs.stat(path.join(realWorkspaceDir, "real", "newdir"))).isDirectory()).toBe(
+          true,
+        );
+
+        // Recursive creation of the (symlinked) mount root stays an authorized
+        // no-op with logical policy and physical pin views.
+        const rootTarget = await bridge.resolvePinnedMutationTarget!({
+          filePath: ".",
+          action: "mkdir",
+        });
+        expect(rootTarget.policyPath).toBe(linkedWorkspaceDir);
+        expect(rootTarget.pinnedPath).toBe(realWorkspaceDir);
+        await bridge.mkdirp({ filePath: ".", pinnedPath: rootTarget.pinnedPath });
+      });
+    },
+  );
 });
 
 async function withTempDir<T>(prefix: string, run: (stateDir: string) => Promise<T>): Promise<T> {

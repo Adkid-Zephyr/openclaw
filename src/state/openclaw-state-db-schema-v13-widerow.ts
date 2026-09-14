@@ -47,12 +47,6 @@ function reprojectLegacyCronJson(db: DatabaseSync): void {
       continue;
     }
     let changed = false;
-    if (typeof job.enabled !== "boolean") {
-      // Early cron rows kept the effective flag only in this retained projection.
-      // Fold it into canonical JSON before schema v13 removes the other projections.
-      job.enabled = row.enabled !== 0;
-      changed = true;
-    }
     const delivery = asNullableRecord(job.delivery);
     const destination = asNullableRecord(delivery?.failureDestination);
     if (
@@ -73,6 +67,12 @@ function reprojectLegacyCronJson(db: DatabaseSync): void {
         nextDelivery.failureDestination = nextDestination;
         job.delivery = nextDelivery;
       }
+    }
+    if (typeof job.enabled !== "boolean") {
+      // Early cron rows kept this flag only in the retained projection.
+      // Restore it after delivery so its change flag cannot create a delivery object.
+      job.enabled = row.enabled !== 0;
+      changed = true;
     }
     const hasLegacyStatus = Object.hasOwn(state, "lastStatus");
     if (
@@ -159,13 +159,16 @@ export function migrateJsonCanonicalWideRowsV13(
     // Attestation-only workspaces borrow their path from an alias when one
     // exists; the legacy attestation table never stored a path, so orphans
     // keep a NULL path and heal it when the workspace next appears.
+    const workspacePath = tableExists(db, "workspace_path_aliases")
+      ? `(SELECT alias.workspace_path FROM workspace_path_aliases alias
+           WHERE alias.workspace_key = a.workspace_key LIMIT 1)`
+      : "NULL";
     db.exec(`
       INSERT INTO workspace_setup_state (
         workspace_key, workspace_path, attested_at_ms, attestation_updated_at_ms
       )
       SELECT a.workspace_key,
-             (SELECT alias.workspace_path FROM workspace_path_aliases alias
-               WHERE alias.workspace_key = a.workspace_key LIMIT 1),
+             ${workspacePath},
              a.attested_at_ms,
              a.updated_at_ms
         FROM workspace_attestations a
