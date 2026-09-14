@@ -359,7 +359,7 @@ describe("createBlockReplyDeliveryHandler", () => {
       blockStreamingEnabled: true,
       blockReplyPipeline: { enqueue } as unknown as BlockReplyPipelineLike,
       directlySentBlockKeys: new Set(),
-      directlySentBlockPayloads: [],
+      directBlockDeliveries: [],
     });
 
     const first = handler({ text: "First block" });
@@ -400,7 +400,7 @@ describe("createBlockReplyDeliveryHandler", () => {
       blockStreamingEnabled: true,
       blockReplyPipeline: { enqueue } as unknown as BlockReplyPipelineLike,
       directlySentBlockKeys: new Set(),
-      directlySentBlockPayloads: [],
+      directBlockDeliveries: [],
     });
 
     const first = handler({ text: "First block" });
