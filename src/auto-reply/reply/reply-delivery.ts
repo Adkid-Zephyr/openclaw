@@ -28,7 +28,7 @@ export function normalizeReplyPayloadDirectives(params: {
   currentMessageId?: string;
   silentToken?: string;
   trimLeadingWhitespace?: boolean;
-  preserveLeadingParagraphBoundary?: boolean;
+  preserveLeadingStreamedSourceBoundary?: boolean;
   parseMode?: ReplyDirectiveParseMode;
   extractMarkdownImages?: boolean;
   extractMediaDirectives?: boolean;
@@ -58,7 +58,7 @@ export function normalizeReplyPayloadDirectives(params: {
   if (
     params.trimLeadingWhitespace &&
     text &&
-    !(params.preserveLeadingParagraphBoundary && /^\n[\t ]*\n+/.test(text))
+    !(params.preserveLeadingStreamedSourceBoundary && text.startsWith("\n"))
   ) {
     text = text.trimStart() || undefined;
   }
@@ -117,7 +117,7 @@ export function createBlockReplyDeliveryHandler(params: {
   replyThreading?: ReplyThreadingPolicy;
   normalizeStreamingText: (
     payload: ReplyPayload,
-    options?: { preserveLeadingParagraphBoundary?: boolean },
+    options?: { preserveLeadingStreamedSourceBoundary?: boolean },
   ) => { text?: string; skip: boolean };
   applyReplyToMode: (payload: ReplyPayload) => ReplyPayload;
   normalizeMediaPaths?: (payload: ReplyPayload) => Promise<ReplyPayload>;
@@ -143,9 +143,9 @@ export function createBlockReplyDeliveryHandler(params: {
     }
     const isSourceTextBlock =
       params.blockStreamingEnabled && isReplyPayloadTerminalContent(payload) && !payload.isError;
-    const preserveLeadingParagraphBoundary = isSourceTextBlock && hasAcceptedTextBlock;
+    const preserveLeadingStreamedSourceBoundary = isSourceTextBlock && hasAcceptedTextBlock;
     const { text, skip } = params.normalizeStreamingText(payload, {
-      preserveLeadingParagraphBoundary,
+      preserveLeadingStreamedSourceBoundary,
     });
     if (skip && !hasOutboundReplyContent({ ...payload, text: undefined })) {
       return;
@@ -181,7 +181,7 @@ export function createBlockReplyDeliveryHandler(params: {
       currentMessageId: params.currentMessageId,
       silentToken: SILENT_REPLY_TOKEN,
       trimLeadingWhitespace: true,
-      preserveLeadingParagraphBoundary,
+      preserveLeadingStreamedSourceBoundary,
       parseMode: "auto",
       extractMediaDirectives: false,
     });
@@ -209,8 +209,8 @@ export function createBlockReplyDeliveryHandler(params: {
       return;
     }
     setReplyPayloadMetadata(blockPayload, {
-      streamedParagraphBoundary:
-        preserveLeadingParagraphBoundary && /^\n[\t ]*\n+/.test(blockPayload.text ?? "")
+      streamedSourceBoundary:
+        preserveLeadingStreamedSourceBoundary && (blockPayload.text ?? "").startsWith("\n")
           ? true
           : undefined,
     });

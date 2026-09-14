@@ -203,21 +203,21 @@ export class EmbeddedBlockChunker {
     }
     const minChars = Math.max(1, Math.floor(chunking?.minChars ?? 1));
     const maxChars = Math.max(minChars, Math.floor(chunking?.maxChars ?? Infinity));
-    const paragraphPrefixLength = (value: string, start = 0) => {
+    const sourceBoundaryLength = (value: string, start = 0) => {
       if (!chunking?.flushOnParagraph) {
         return 0;
       }
-      const match = value.slice(start).match(/^\n[\t ]*\n+[\t ]*|^\n[\t ]*$/)?.[0];
+      const match = value.slice(start).match(/^(?:\n[\t ]*)+/)?.[0];
       return match?.length ?? 0;
     };
     const nextTextStart = (value: string, start: number) => {
-      const length = paragraphPrefixLength(value, start);
+      const length = sourceBoundaryLength(value, start);
       return length && (start + length === value.length || length < maxChars)
         ? start
         : skipLeadingNewlines(value, start + length);
     };
-    // A retained single newline can be disproved by the next delta/checkpoint.
-    // Consume it here so replacement offsets still address the original source.
+    // Retained line breaks remain source bytes even if the next delta does not
+    // extend them into a paragraph. Only skip boundaries that cannot fit a block.
     if (chunking?.flushOnParagraph && this.#consumedLength > 0 && !this.#reopenPrefix) {
       const skipped = nextTextStart(this.#buffer, 0);
       this.#buffer = this.#buffer.slice(skipped);
@@ -325,7 +325,7 @@ export class EmbeddedBlockChunker {
       }
 
       const view = source.slice(start);
-      const prefixLength = paragraphPrefixLength(source, start);
+      const prefixLength = sourceBoundaryLength(source, start);
       if (prefixLength === view.length) {
         break;
       }

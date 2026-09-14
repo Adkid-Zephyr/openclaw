@@ -374,13 +374,13 @@ describe("EmbeddedBlockChunker", () => {
   );
 
   it.each([
-    { prefix: "A", tail: "\n", maxChars: 10, expectedTail: "B" },
-    { prefix: "A", tail: "\n ", maxChars: 10, expectedTail: " B" },
-    { prefix: "A", tail: "\n\t", maxChars: 10, expectedTail: "\tB" },
-    { prefix: "AA", tail: "\n ", maxChars: 3, expectedTail: " B" },
+    { prefix: "A", tail: "\n", maxChars: 10 },
+    { prefix: "A", tail: "\n ", maxChars: 10 },
+    { prefix: "A", tail: "\n\t", maxChars: 10 },
+    { prefix: "AA", tail: "\n ", maxChars: 3 },
   ])(
-    "uses legacy newline trimming when retained partial $tail is not a paragraph separator",
-    ({ expectedTail, maxChars, prefix, tail }) => {
+    "preserves retained source $tail when the next delta completes a single line break",
+    ({ maxChars, prefix, tail }) => {
       const chunker = createFlushOnParagraphChunker({ minChars: 1, maxChars });
 
       chunker.append(`${prefix}${tail}`);
@@ -391,8 +391,28 @@ describe("EmbeddedBlockChunker", () => {
       chunker.append("B");
       chunks.push(...drainChunks(chunker, true));
 
-      expect(chunks).toEqual([prefix, expectedTail]);
+      expect(chunks).toEqual([prefix, `${tail}B`]);
+      expect(chunks.join("")).toBe(`${prefix}${tail}B`);
+      expectChunksWithinLength(chunks, maxChars);
+      expect(chunker.consumedLength).toBe(`${prefix}${tail}B`.length);
       expect(chunker.bufferedText).toBe("");
+    },
+  );
+
+  it.each(["Second.", "\nSecond."])(
+    "preserves forced ACP punctuation boundaries before %j",
+    (nextDelta) => {
+      const chunker = createFlushOnParagraphChunker({ minChars: 1, maxChars: 20 });
+      chunker.append("First.\n");
+      const chunks = drainChunks(chunker, true);
+      chunker.append(nextDelta);
+      chunks.push(...drainChunks(chunker, true));
+
+      expect(chunks.join("")).toBe(`First.\n${nextDelta}`);
+      expect(chunks.every((chunk) => chunk.trim().length > 0)).toBe(true);
+      expectChunksWithinLength(chunks, 20);
+      expect(chunker.consumedLength).toBe(`First.\n${nextDelta}`.length);
+      expect(chunker.hasBuffered()).toBe(false);
     },
   );
 

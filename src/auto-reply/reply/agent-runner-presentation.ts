@@ -77,7 +77,7 @@ export function createAgentTurnPresentation(params: {
   const sanitizeStreamingText = (
     text: string | undefined,
     errorContext: boolean,
-    preserveLeadingParagraphBoundary = false,
+    preserveLeadingStreamedSourceBoundary = false,
   ): { text?: string; skip: boolean } => {
     if (!text) {
       return { skip: true };
@@ -89,14 +89,14 @@ export function createAgentTurnPresentation(params: {
       : sanitizeUserFacingText(text, {
           conversationContext,
           streaming: true,
-          preserveLeadingParagraphBoundary,
+          preserveLeadingStreamedSourceBoundary,
         });
     return sanitized.trim() ? { text: sanitized, skip: false } : { skip: true };
   };
 
   const normalizeStreamingText = (
     payload: ReplyPayload,
-    options?: { preserveLeadingParagraphBoundary?: boolean },
+    options?: { preserveLeadingStreamedSourceBoundary?: boolean },
   ): { text?: string; skip: boolean } => {
     const classified = classifyStreamingPartial(payload);
     if (classified.skip || !classified.text) {
@@ -105,7 +105,7 @@ export function createAgentTurnPresentation(params: {
     return sanitizeStreamingText(
       classified.text,
       Boolean(payload.isError),
-      options?.preserveLeadingParagraphBoundary,
+      options?.preserveLeadingStreamedSourceBoundary,
     );
   };
 

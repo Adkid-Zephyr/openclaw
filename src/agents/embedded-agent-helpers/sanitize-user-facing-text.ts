@@ -268,7 +268,7 @@ export function sanitizeUserFacingText(
     errorContext?: boolean;
     conversationContext?: string;
     streaming?: boolean;
-    preserveLeadingParagraphBoundary?: boolean;
+    preserveLeadingStreamedSourceBoundary?: boolean;
   },
 ): string {
   const raw = coerceChatContentText(text);
@@ -285,11 +285,11 @@ export function sanitizeUserFacingText(
         )
       : raw;
   const filters = userFacingTextFilters(opts?.errorContext, opts?.streaming);
-  const preserveParagraphBoundary =
-    opts?.preserveLeadingParagraphBoundary && /^\n[\t ]*\n+/.test(withoutConversationContext);
+  const preserveSourceBoundary =
+    opts?.preserveLeadingStreamedSourceBoundary && withoutConversationContext.startsWith("\n");
   return applyTextFilters(
     withoutConversationContext,
-    preserveParagraphBoundary
+    preserveSourceBoundary
       ? filters.filter((filter) => filter !== leadingEmptyLinesTextFilter)
       : filters,
   );

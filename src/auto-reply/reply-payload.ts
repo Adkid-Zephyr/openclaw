@@ -199,8 +199,8 @@ export type ReplyPayloadMetadata = {
   assistantMessageIndex?: number;
   /** Visible source represented by this block, excluding synthetic chunk wrappers. */
   blockSourceText?: string;
-  /** A source text block continues an already accepted block with a paragraph separator. */
-  streamedParagraphBoundary?: true;
+  /** A source text block continues an already accepted block with an original line break. */
+  streamedSourceBoundary?: true;
   /** Persisted assistant speech facts; never serialized into channel payloads. */
   tts?: AssistantDeliveryTtsFacts;
   /** Structured message-tool speech is an explicit request, independent of auto-TTS mode. */

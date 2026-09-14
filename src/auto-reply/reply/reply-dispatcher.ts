@@ -218,7 +218,7 @@ type NormalizeReplyPayloadInternalOptions = Pick<
   | "transformReplyPayload"
 > & {
   conversationContext?: string;
-  preserveLeadingParagraphBoundary?: boolean;
+  preserveLeadingStreamedSourceBoundary?: boolean;
   onSkip?: (reason: NormalizeReplySkipReason) => void;
 };
 
@@ -235,7 +235,7 @@ function normalizeReplyPayloadInternal(
     onHeartbeatStrip: opts.onHeartbeatStrip,
     transformReplyPayload: opts.transformReplyPayload,
     conversationContext: opts.conversationContext,
-    preserveLeadingParagraphBoundary: opts.preserveLeadingParagraphBoundary,
+    preserveLeadingStreamedSourceBoundary: opts.preserveLeadingStreamedSourceBoundary,
     onSkip: opts.onSkip,
   });
 }
@@ -340,8 +340,8 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
       responsePrefixContextProvider: options.responsePrefixContextProvider,
       transformReplyPayload: options.transformReplyPayload,
       conversationContext: conversationContextsByDispatcher.get(dispatcher),
-      preserveLeadingParagraphBoundary:
-        kind === "block" && getReplyPayloadMetadata(payload)?.streamedParagraphBoundary === true,
+      preserveLeadingStreamedSourceBoundary:
+        kind === "block" && getReplyPayloadMetadata(payload)?.streamedSourceBoundary === true,
       onHeartbeatStrip: options.onHeartbeatStrip,
       onSkip: notifySkip
         ? (reason) =>

@@ -54,7 +54,7 @@ function resolveNormalizeReplyTransformOwner(
 type NormalizeReplyOptions = {
   responsePrefix?: string;
   applyChannelTransforms?: boolean;
-  preserveLeadingParagraphBoundary?: boolean;
+  preserveLeadingStreamedSourceBoundary?: boolean;
   /** Context for template variable interpolation in responsePrefix */
   responsePrefixContext?: ResponsePrefixContext;
   onHeartbeatStrip?: () => void;
@@ -141,7 +141,7 @@ export function normalizeReplyPayloadOutcome(
           })
         : sanitizeUserFacingText(text, {
             conversationContext: opts.conversationContext,
-            preserveLeadingParagraphBoundary: opts.preserveLeadingParagraphBoundary,
+            preserveLeadingStreamedSourceBoundary: opts.preserveLeadingStreamedSourceBoundary,
           });
     }
     if (!hasContent(text)) {

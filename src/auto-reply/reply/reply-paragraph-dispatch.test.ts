@@ -73,18 +73,23 @@ function createParagraphDispatch(coalescing = false) {
 }
 
 describe("streamed paragraph dispatch", () => {
-  it.each([false, true])(
-    "preserves a copied continuation through normalization and hooks (media coalescing=%s)",
-    async (coalescing) => {
+  it.each([
+    { coalescing: false, prefix: "\n" },
+    { coalescing: true, prefix: "\n" },
+    { coalescing: false, prefix: "\n \n" },
+    { coalescing: true, prefix: "\n \n" },
+  ])(
+    "preserves a copied $prefix continuation through normalization and hooks (coalescing=$coalescing)",
+    async ({ coalescing, prefix }) => {
       const flow = createParagraphDispatch(coalescing);
       await flow.handler({ text: "\n\nFirst" });
       await flow.flush();
-      await flow.handler({ text: "\n \nSecond" });
+      await flow.handler({ text: `${prefix}Second` });
       if (coalescing) {
         await flow.handler({ text: "Caption", mediaUrl: "https://example.invalid/image.png" });
       }
       await flow.flush();
-      const expected = ["First", coalescing ? "\n \nSecond\n\nCaption" : "\n \nSecond"];
+      const expected = ["First", `${prefix}Second${coalescing ? "\n\nCaption" : ""}`];
       expect(flow.beforeDelivery.map((payload) => payload.text)).toEqual(expected);
       expect(flow.delivered.map((payload) => payload.text)).toEqual(expected);
       expect(flow.delivered.every((payload) => Boolean(payload.text?.trim()))).toBe(true);
@@ -120,7 +125,7 @@ describe("streamed paragraph dispatch", () => {
     await flow.handler({ text: "\n\nSecond" });
     await flow.flush();
     const continuation = expectDefined(flow.sourcePayloads[1], "source continuation block");
-    const unmarked = { text: "\n\nUnmarked", streamedParagraphBoundary: true };
+    const unmarked = { text: "\n\nUnmarked", streamedSourceBoundary: true };
     flow.dispatcher.sendBlockReply(unmarked);
     flow.dispatcher.sendBlockReply(
       copyReplyPayloadMetadata(continuation, { text: "\n\nVisible error", isError: true }),

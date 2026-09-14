@@ -119,12 +119,12 @@ export function createBlockReplyCoalescer(params: {
       bufferedPayload ?? mergedPayload,
       mergedPayload,
     );
-    const streamedParagraphBoundary =
-      getReplyPayloadMetadata(metadataMergedPayload)?.streamedParagraphBoundary;
+    const streamedSourceBoundary =
+      getReplyPayloadMetadata(metadataMergedPayload)?.streamedSourceBoundary;
     resetBuffer();
     return setReplyPayloadMetadata(copyReplyPayloadMetadata(payload, metadataMergedPayload), {
       blockSourceText: mergedSourceText,
-      streamedParagraphBoundary,
+      streamedSourceBoundary,
     });
   };
 
