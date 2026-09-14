@@ -1,6 +1,7 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, onTestFinished } from "vitest";
-import { copyReplyPayloadMetadata } from "../reply-payload.js";
+import { EmbeddedBlockChunker } from "../../agents/embedded-agent-block-chunker.js";
+import { copyReplyPayloadMetadata, setReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
 import type { AgentTurnParams } from "./agent-runner-execution.types.js";
 import { createAgentTurnPresentation } from "./agent-runner-presentation.js";
@@ -9,7 +10,10 @@ import { createReplyDispatcher } from "./reply-dispatcher.js";
 import { createMockTypingController } from "./test-helpers.js";
 import { createTypingSignaler } from "./typing-mode.js";
 
-function createParagraphDispatch(coalescing = false) {
+function createParagraphDispatch(
+  coalescing = false,
+  { maxChars = 200, joiner = "\n\n" }: { maxChars?: number; joiner?: string } = {},
+) {
   const beforeDelivery: ReplyPayload[] = [];
   const delivered: ReplyPayload[] = [];
   const sourcePayloads: ReplyPayload[] = [];
@@ -30,9 +34,7 @@ function createParagraphDispatch(coalescing = false) {
   };
   const pipeline = createBlockReplyPipeline({
     timeoutMs: 5000,
-    ...(coalescing
-      ? { coalescing: { minChars: 1, maxChars: 200, idleMs: 0, joiner: "\n\n" } }
-      : {}),
+    ...(coalescing ? { coalescing: { minChars: 1, maxChars, idleMs: 0, joiner } } : {}),
     onBlockReply,
   });
   const turn = {
@@ -73,6 +75,47 @@ function createParagraphDispatch(coalescing = false) {
 }
 
 describe("streamed paragraph dispatch", () => {
+  it.each(["\n", "\n ", "\n\n", "\n \n"])(
+    "keeps multiple %j source boundaries when one forced drain is coalesced",
+    async (boundary) => {
+      const first = "12345678901234567890";
+      const input = `${first}${boundary}B${boundary}C`;
+      const chunker = new EmbeddedBlockChunker({
+        minChars: 1,
+        maxChars: 20,
+        breakPreference: "newline",
+        flushOnParagraph: true,
+      });
+      const chunks: ReplyPayload[] = [];
+      chunker.append(input);
+      chunker.drain({
+        force: true,
+        emit: (text, options) => {
+          chunks.push(setReplyPayloadMetadata({ text }, { blockSourceText: options?.sourceText }));
+        },
+      });
+      expect(chunks.map((payload) => payload.text)).toEqual([
+        first,
+        `${boundary}B`,
+        `${boundary}C`,
+      ]);
+
+      const flow = createParagraphDispatch(true, { maxChars: 20, joiner: "\n" });
+      for (const payload of chunks) {
+        await flow.handler(payload);
+      }
+      await flow.flush();
+      expect(flow.delivered.map((payload) => payload.text)).toEqual([
+        first,
+        `${boundary}B${boundary}C`,
+      ]);
+      expect(flow.delivered.map((payload) => payload.text).join("")).toBe(input);
+      expect(
+        flow.delivered.every((payload) => payload.text?.trim() && payload.text.length <= 20),
+      ).toBe(true);
+    },
+  );
+
   it.each([
     { coalescing: false, prefix: "\n" },
     { coalescing: true, prefix: "\n" },

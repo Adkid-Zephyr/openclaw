@@ -29,7 +29,7 @@ export function createBlockReplyCoalescer(params: {
   const idleMs = Math.max(0, Math.floor(config.idleMs));
   const joiner = config.joiner ?? "";
   const joinText = (left: string, right: string) =>
-    `${left}${/^\n[\t ]*\n+/.test(right) ? "" : joiner}${right}`;
+    `${left}${right.startsWith("\n") ? "" : joiner}${right}`;
   const flushOnEnqueue = config.flushOnEnqueue === true;
 
   let bufferText = "";
