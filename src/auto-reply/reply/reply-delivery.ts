@@ -115,7 +115,10 @@ export function createBlockReplyDeliveryHandler(params: {
   onBlockReply: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
   currentMessageId?: string;
   replyThreading?: ReplyThreadingPolicy;
-  normalizeStreamingText: (payload: ReplyPayload) => { text?: string; skip: boolean };
+  normalizeStreamingText: (
+    payload: ReplyPayload,
+    options?: { preserveLeadingParagraphBoundary?: boolean },
+  ) => { text?: string; skip: boolean };
   applyReplyToMode: (payload: ReplyPayload) => ReplyPayload;
   normalizeMediaPaths?: (payload: ReplyPayload) => Promise<ReplyPayload>;
   typingSignals: TypingSignaler;
@@ -138,13 +141,15 @@ export function createBlockReplyDeliveryHandler(params: {
     ) {
       return;
     }
-    const { text, skip } = params.normalizeStreamingText(payload);
-    if (skip && !hasOutboundReplyContent({ ...payload, text: undefined })) {
-      return;
-    }
     const isSourceTextBlock =
       params.blockStreamingEnabled && isReplyPayloadTerminalContent(payload) && !payload.isError;
     const preserveLeadingParagraphBoundary = isSourceTextBlock && hasAcceptedTextBlock;
+    const { text, skip } = params.normalizeStreamingText(payload, {
+      preserveLeadingParagraphBoundary,
+    });
+    if (skip && !hasOutboundReplyContent({ ...payload, text: undefined })) {
+      return;
+    }
 
     const implicitCurrentMessageAllowed =
       payload.replyToCurrent === true

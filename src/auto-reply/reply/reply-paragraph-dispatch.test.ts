@@ -1,8 +1,9 @@
 import { describe, expect, it, onTestFinished } from "vitest";
 import { copyReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
+import type { AgentTurnParams } from "./agent-runner-execution.types.js";
+import { createAgentTurnPresentation } from "./agent-runner-presentation.js";
 import { createBlockReplyPipeline } from "./block-reply-pipeline.js";
-import { createBlockReplyDeliveryHandler } from "./reply-delivery.js";
 import { createReplyDispatcher } from "./reply-dispatcher.js";
 import { createMockTypingController } from "./test-helpers.js";
 import { createTypingSignaler } from "./typing-mode.js";
@@ -20,34 +21,43 @@ function createParagraphDispatch(coalescing = false) {
       delivered.push(payload);
     },
   });
+  const onBlockReply = async (payload: ReplyPayload) => {
+    const copied = copyReplyPayloadMetadata(payload, { ...payload });
+    sourcePayloads.push(copied);
+    dispatcher.sendBlockReply(copied);
+    await dispatcher.waitForIdle();
+  };
   const pipeline = createBlockReplyPipeline({
     timeoutMs: 5000,
     ...(coalescing
       ? { coalescing: { minChars: 1, maxChars: 200, idleMs: 0, joiner: "\n\n" } }
       : {}),
-    onBlockReply: async (payload) => {
-      const copied = copyReplyPayloadMetadata(payload, { ...payload });
-      sourcePayloads.push(copied);
-      dispatcher.sendBlockReply(copied);
-      await dispatcher.waitForIdle();
-    },
+    onBlockReply,
   });
-  const handler = createBlockReplyDeliveryHandler({
-    onBlockReply: async () => {},
-    normalizeStreamingText: (payload) => ({ text: payload.text, skip: false }),
-    applyReplyToMode: (payload) => payload,
+  const turn = {
+    followupRun: { run: { silentExpected: false } },
+    isHeartbeat: false,
+    sessionCtx: {},
+    opts: { onBlockReply, reasoningPayloadsEnabled: true, commentaryPayloadsEnabled: true },
+    applyReplyToMode: (payload: ReplyPayload) => payload,
     typingSignals: createTypingSignaler({
       typing: createMockTypingController(),
       mode: "never",
       isHeartbeat: false,
     }),
-    reasoningPayloadsEnabled: true,
-    commentaryPayloadsEnabled: true,
     blockStreamingEnabled: true,
     blockReplyPipeline: pipeline,
+  } as unknown as AgentTurnParams;
+  const handler = createAgentTurnPresentation({
+    turn,
+    replyMediaContext: { normalizePayload: async (payload) => payload },
     directlySentBlockKeys: new Set(),
     directBlockDeliveries: [],
-  });
+    heartbeatState: { didLogStrip: false },
+  }).blockReplyHandler;
+  if (!handler) {
+    throw new Error("Expected the real presentation block reply handler");
+  }
   const flush = async () => {
     await pipeline.flush({ force: true });
     await dispatcher.waitForIdle();
