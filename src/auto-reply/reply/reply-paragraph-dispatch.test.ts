@@ -1,3 +1,4 @@
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, onTestFinished } from "vitest";
 import { copyReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
@@ -118,7 +119,7 @@ describe("streamed paragraph dispatch", () => {
     await flow.handler({ text: "First" });
     await flow.handler({ text: "\n\nSecond" });
     await flow.flush();
-    const continuation = flow.sourcePayloads[1];
+    const continuation = expectDefined(flow.sourcePayloads[1], "source continuation block");
     const unmarked = { text: "\n\nUnmarked", streamedParagraphBoundary: true };
     flow.dispatcher.sendBlockReply(unmarked);
     flow.dispatcher.sendBlockReply(
@@ -149,7 +150,8 @@ describe("streamed paragraph dispatch", () => {
       await flow.handler({ text: "First" });
       await flow.handler({ text: "\n\nSecond" });
       await flow.flush();
-      const payload = copyReplyPayloadMetadata(flow.sourcePayloads[1], {
+      const continuation = expectDefined(flow.sourcePayloads[1], "source continuation block");
+      const payload = copyReplyPayloadMetadata(continuation, {
         text: "\n\nCompleted answer",
       });
       const prepared = flow.dispatcher.prepareReplyPayload?.("block", payload);
