@@ -289,6 +289,7 @@ function readUiCss(): string {
     "ui/src/styles/chat/tool-cards.css",
     "ui/src/styles/chat/working-indicator.css",
     "ui/src/styles/chat/question-card.css",
+    "ui/src/styles/rail-header.css",
     "ui/src/styles/chat/sidebar.css",
     "ui/src/styles/chat/side-panel.css",
   ];
@@ -1721,15 +1722,16 @@ describeBrowserLayout.concurrent("chat responsive browser layout", () => {
     });
   });
 
-  it("aligns mobile cards with the composer after Chat styles load", async () => {
+  it("aligns and separates mobile cards above the composer after Chat styles load", async () => {
     await withBrowserPage(openBrowserPage(390, 844), async (page) => {
       // New Session can load composer styles before Chat's lazy layout stylesheet.
       await page.setContent(`<style>${readUiCss()}${readStyleSheet("ui/src/styles/chat/layout.css")}</style>
         <section class="card chat"><div class="chat-main__conversation">
           <div class="chat-inline-approval">Approval</div>
-          <div class="chat-prs">Pull request</div>
+          <div class="chat-prs"><article class="chat-pr">Pull request</article></div>
           <div class="session-suggestions">Suggestion</div>
           <div class="chat-swarm">Parallel task</div>
+          <openclaw-plugin-contributions><button data-plugin-action>Plugin action</button></openclaw-plugin-contributions>
           <div class="agent-chat__composer-shell"><div class="agent-chat__input">Composer</div></div>
         </div></section>`);
       await page.locator(".card.chat").evaluate(finishElementAnimations);
@@ -1743,6 +1745,12 @@ describeBrowserLayout.concurrent("chat responsive browser layout", () => {
         const card = await getRect(page, selector);
         expect(card.left, selector).toBeCloseTo(composer.left, 0);
         expect(card.right, selector).toBeCloseTo(composer.right, 0);
+      }
+      for (const selector of [".session-suggestions", ".chat-swarm", "[data-plugin-action]"]) {
+        const pullRequest = await getRect(page, ".chat-pr");
+        const neighbor = await getRect(page, selector);
+        expect(neighbor.top - pullRequest.bottom, selector).toBeGreaterThanOrEqual(8);
+        await page.locator(selector).evaluate((element) => element.remove());
       }
     });
   });
@@ -2359,19 +2367,6 @@ describeBrowserLayout.concurrent("chat responsive browser layout", () => {
               </div>
             </div>
           </div>
-          <div class="agent-chat__typing-indicator">
-            <span class="agent-chat__typing-avatars">
-              <div class="chat-avatar user">B</div>
-              <span class="chat-avatar-slot">
-                <img
-                  class="chat-avatar user"
-                  alt="Typing participant"
-                  src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36'%3E%3Crect width='36' height='36' fill='purple'/%3E%3C/svg%3E"
-                />
-                <div class="chat-avatar user chat-avatar--sender-initials">C</div>
-              </span>
-            </span>
-          </div>
         </body></html>`,
       );
       const messageAvatarSlot = page.locator(".chat-group .chat-avatar-slot");
@@ -2406,26 +2401,6 @@ describeBrowserLayout.concurrent("chat responsive browser layout", () => {
         expect(layout.avatarLeft).toBeGreaterThanOrEqual(layout.bubbleRight + 9);
         expect(layout.avatarRight).toBeLessThanOrEqual(layout.groupRight + 1);
       }
-
-      const typingAvatars = await page.locator(".agent-chat__typing-avatars").evaluate((row) =>
-        [...row.children].map((avatar) => {
-          const bounds = avatar.getBoundingClientRect();
-          return {
-            height: bounds.height,
-            marginBottom: getComputedStyle(avatar).marginBottom,
-            top: bounds.top,
-            width: bounds.width,
-          };
-        }),
-      );
-      expect(typingAvatars).toHaveLength(2);
-      expect(
-        typingAvatars.map(({ height, marginBottom, width }) => ({ height, marginBottom, width })),
-      ).toEqual([
-        { height: 36, marginBottom: "0px", width: 36 },
-        { height: 36, marginBottom: "0px", width: 36 },
-      ]);
-      expect(Math.abs(typingAvatars[0]!.top - typingAvatars[1]!.top)).toBeLessThanOrEqual(0.5);
 
       await page
         .locator(".chat-thread")

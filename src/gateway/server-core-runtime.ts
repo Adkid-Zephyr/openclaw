@@ -97,6 +97,7 @@ export async function startGatewayCoreRuntime(input: {
     chatRunState,
     removeChatRun,
     agentRunSeq,
+    nodeHasSessionSubscribers,
     nodeSendToSession,
     runtimeState,
     kernel,
@@ -234,9 +235,11 @@ export async function startGatewayCoreRuntime(input: {
     ...runtimeSubscriptionUnsubs
   } = await startupTrace.measure("runtime.subscriptions", () =>
     startGatewayEventSubscriptions({
+      signal: runtime.connectionWork.signal,
       log,
       broadcast,
       broadcastToConnIds,
+      nodeHasSessionSubscribers,
       nodeSendToSession,
       agentRunSeq,
       chatRunState,
